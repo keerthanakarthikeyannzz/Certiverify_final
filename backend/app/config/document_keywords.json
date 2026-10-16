@@ -1,0 +1,189 @@
+{
+  "_comment": "Centralized keyword dictionary for OCR-based document classification. Weights: long/specific phrases = 4-5, mid-length = 3, single keywords = 1-2. Do NOT hardcode these in Python source.",
+  "document_types": {
+    "aadhaar_card": {
+      "display_name": "Aadhaar Card",
+      "keywords": [
+        { "phrase": "unique identification authority of india", "weight": 5 },
+        { "phrase": "government of india",                      "weight": 5 },
+        { "phrase": "your aadhaar no",                         "weight": 5 },
+        { "phrase": "aadhaar no",                              "weight": 5 },
+        { "phrase": "uidai",                                   "weight": 4 },
+        { "phrase": "aadhaar",                                 "weight": 4 },
+        { "phrase": "masked aadhaar",                          "weight": 4 },
+        { "phrase": "aadhaar number",                          "weight": 4 },
+        { "phrase": "enrolment no",                            "weight": 4 },
+        { "phrase": "enrolment number",                        "weight": 4 },
+        { "phrase": "enrolment id",                            "weight": 3 },
+        { "phrase": "qr code",                                 "weight": 3 },
+        { "phrase": "vid",                                     "weight": 2 },
+        { "phrase": "date of birth",                           "weight": 2 },
+        { "phrase": "year of birth",                           "weight": 2 },
+        { "phrase": "dob",                                     "weight": 2 },
+        { "phrase": "government emblem",                       "weight": 2 },
+        { "phrase": "male",                                    "weight": 1 },
+        { "phrase": "female",                                  "weight": 1 },
+        { "phrase": "resident",                                "weight": 1 }
+      ],
+      "regex_validators": {
+        "aadhaar_number":   "[2-9][0-9]{3}\\s[0-9]{4}\\s[0-9]{4}",
+        "masked_aadhaar":   "xxxx\\s?xxxx\\s?[0-9]{4}",
+        "year_of_birth":    "(?:year of birth|yob)[:\\s]+([12][0-9]{3})",
+        "enrolment_number": "[0-9]{4}/[0-9]{5}/[0-9]{5}",
+        "vid_number":       "(?:vid|virtual id)[:\\s]+[0-9]{4}\\s?[0-9]{4}\\s?[0-9]{4}\\s?[0-9]{4}"
+      }
+    },
+    "marksheet": {
+      "display_name": "SSLC Marksheet",
+      "keywords": [
+        { "phrase": "state board of school examinations",   "weight": 5 },
+        { "phrase": "secondary school leaving certificate", "weight": 5 },
+        { "phrase": "statement of marks",                  "weight": 5 },
+        { "phrase": "mark certificate",                    "weight": 5 },
+        { "phrase": "controller of examinations",          "weight": 5 },
+        { "phrase": "marksheet",                           "weight": 5 },
+        { "phrase": "mark sheet",                          "weight": 5 },
+        { "phrase": "higher secondary certificate",        "weight": 5 },
+        { "phrase": "permanent register number",           "weight": 4 },
+        { "phrase": "board of examinations",               "weight": 4 },
+        { "phrase": "higher secondary",                    "weight": 4 },
+        { "phrase": "sslc",                                "weight": 4 },
+        { "phrase": "hsc",                                 "weight": 4 },
+        { "phrase": "register number",                     "weight": 3 },
+        { "phrase": "roll number",                         "weight": 3 },
+        { "phrase": "school name",                         "weight": 3 },
+        { "phrase": "internal marks",                      "weight": 3 },
+        { "phrase": "external marks",                      "weight": 3 },
+        { "phrase": "total marks",                         "weight": 3 },
+        { "phrase": "percentage",                          "weight": 3 },
+        { "phrase": "grade",                               "weight": 3 },
+        { "phrase": "subject",                             "weight": 3 },
+        { "phrase": "cgpa",                                "weight": 3 },
+        { "phrase": "medium of instruction",               "weight": 2 },
+        { "phrase": "board examination",                   "weight": 2 },
+        { "phrase": "state board",                         "weight": 2 },
+        { "phrase": "school",                              "weight": 2 },
+        { "phrase": "result",                              "weight": 2 },
+        { "phrase": "gpa",                                 "weight": 2 },
+        { "phrase": "semester",                            "weight": 2 },
+        { "phrase": "university",                          "weight": 2 },
+        { "phrase": "examination",                         "weight": 2 },
+        { "phrase": "pass",                                "weight": 1 },
+        { "phrase": "fail",                                "weight": 1 },
+        { "phrase": "credits",                             "weight": 1 }
+      ],
+      "regex_validators": {
+        "cgpa":                    "cgpa\\s*[:\\-]?\\s*([0-9]\\.[0-9]{1,2})",
+        "register_number":         "(?:reg(?:istration)?\\s*no|register\\s*number|permanent\\s*register\\s*number)\\s*[:\\-]?\\s*([A-Z0-9/\\-]{4,20})",
+        "register_number_digits":  "\\b(\\d{8,15})\\b",
+        "roll_number":             "roll\\s*(?:no|number)\\s*[:\\-]?\\s*([A-Z0-9/\\-]{2,20})",
+        "percentage":              "([0-9]{1,3}(?:\\.[0-9]{1,2})?)\\s*%",
+        "total_marks":             "(?:total\\s*marks?|grand\\s*total)\\s*[:\\-]?\\s*(\\d{3,4})",
+        "semester":                "(?:semester|sem)\\s*[:\\-]?\\s*([IVXivx1-8]{1,3})"
+      }
+    },
+    "transfer_certificate": {
+      "display_name": "Transfer Certificate",
+      "keywords": [
+        { "phrase": "transfer certificate",  "weight": 5 },
+        { "phrase": "school leaving",        "weight": 5 },
+        { "phrase": "leaving certificate",   "weight": 5 },
+        { "phrase": "tc number",             "weight": 4 },
+        { "phrase": "tc no",                 "weight": 4 },
+        { "phrase": "date of leaving",       "weight": 4 },
+        { "phrase": "admission number",      "weight": 3 },
+        { "phrase": "last studied",          "weight": 3 },
+        { "phrase": "conduct",               "weight": 2 },
+        { "phrase": "character",             "weight": 2 },
+        { "phrase": "principal",             "weight": 2 },
+        { "phrase": "institution",           "weight": 1 }
+      ],
+      "regex_validators": {
+        "tc_number":        "(?:tc|transfer certificate)\\s*(?:no\\.?|number)\\s*[:\\-]?\\s*([A-Z0-9/\\-]{3,20})",
+        "date_of_leaving":  "date\\s*of\\s*leaving\\s*[:\\-]?\\s*([\\d]{1,2}[/\\-.][\\d]{1,2}[/\\-.][\\d]{2,4})",
+        "admission_number": "admission\\s*(?:no\\.?|number)\\s*[:\\-]?\\s*([A-Z0-9/\\-]{3,20})"
+      }
+    },
+    "diploma": {
+      "display_name": "Diploma Certificate",
+      "keywords": [
+        { "phrase": "board of technical education",       "weight": 5 },
+        { "phrase": "directorate of technical education", "weight": 5 },
+        { "phrase": "polytechnic",                        "weight": 4 },
+        { "phrase": "diploma certificate",                "weight": 4 },
+        { "phrase": "diploma in",                         "weight": 4 },
+        { "phrase": "diploma",                            "weight": 3 },
+        { "phrase": "awarded",                            "weight": 2 },
+        { "phrase": "passed",                             "weight": 2 },
+        { "phrase": "year of passing",                    "weight": 2 },
+        { "phrase": "examination",                        "weight": 2 },
+        { "phrase": "department",                         "weight": 1 },
+        { "phrase": "institute",                          "weight": 1 }
+      ],
+      "regex_validators": {
+        "diploma_title":   "diploma\\s*(?:in|of)?\\s*([A-Za-z ]{3,60})",
+        "year_of_passing": "(?:year of passing|passed in|passing year)\\s*[:\\-]?\\s*([12][0-9]{3})"
+      }
+    },
+    "degree_certificate": {
+      "display_name": "Degree Certificate",
+      "keywords": [
+        { "phrase": "awarded the degree",        "weight": 5 },
+        { "phrase": "certificate of graduation", "weight": 5 },
+        { "phrase": "bachelor of engineering",   "weight": 5 },
+        { "phrase": "bachelor of technology",    "weight": 5 },
+        { "phrase": "master of technology",      "weight": 5 },
+        { "phrase": "bachelor of science",       "weight": 5 },
+        { "phrase": "master of science",         "weight": 5 },
+        { "phrase": "degree certificate",        "weight": 4 },
+        { "phrase": "vice chancellor",           "weight": 4 },
+        { "phrase": "registrar",                 "weight": 3 },
+        { "phrase": "convocation",               "weight": 3 },
+        { "phrase": "faculty",                   "weight": 2 },
+        { "phrase": "engineering",               "weight": 2 },
+        { "phrase": "course",                    "weight": 2 },
+        { "phrase": "university",                "weight": 2 },
+        { "phrase": "department",                "weight": 2 },
+        { "phrase": "degree",                    "weight": 2 }
+      ],
+      "regex_validators": {
+        "degree_title": "(?:bachelor|master|doctor)\\s*of\\s*([A-Za-z ]{3,60})",
+        "university":   "([A-Z][A-Za-z& .]{3,60}\\s(?:university|institute of technology))"
+      }
+    },
+    "resume": {
+      "display_name": "Resume / CV",
+      "keywords": [
+        { "phrase": "curriculum vitae",      "weight": 5 },
+        { "phrase": "resume",                "weight": 5 },
+        { "phrase": "cv",                    "weight": 4 },
+        { "phrase": "career objective",      "weight": 4 },
+        { "phrase": "professional summary",  "weight": 4 },
+        { "phrase": "objective",             "weight": 3 },
+        { "phrase": "projects",              "weight": 3 },
+        { "phrase": "internships",           "weight": 3 },
+        { "phrase": "certifications",        "weight": 3 },
+        { "phrase": "achievements",          "weight": 3 },
+        { "phrase": "linkedin",              "weight": 3 },
+        { "phrase": "github",               "weight": 3 },
+        { "phrase": "profile",               "weight": 2 },
+        { "phrase": "experience",            "weight": 2 },
+        { "phrase": "skills",                "weight": 2 },
+        { "phrase": "education",             "weight": 2 },
+        { "phrase": "languages",             "weight": 2 },
+        { "phrase": "contact",               "weight": 1 },
+        { "phrase": "email",                 "weight": 1 },
+        { "phrase": "phone",                 "weight": 1 },
+        { "phrase": "address",               "weight": 1 }
+      ],
+      "regex_validators": {
+        "email":      "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}",
+        "phone":      "(?:\\+91[\\-\\s]?)?[6-9][0-9]{9}",
+        "linkedin":   "linkedin\\.com/in/[A-Za-z0-9\\-._~]+",
+        "github":     "github\\.com/[A-Za-z0-9\\-._~]+",
+        "cgpa":       "(?:cgpa|gpa)\\s*[:\\-]?\\s*([0-9]\\.[0-9]{1,2})",
+        "percentage": "([0-9]{1,3}(?:\\.[0-9]{1,2})?)\\s*%"
+      }
+    }
+  }
+}

@@ -1,0 +1,123 @@
+[
+  {
+    "area": "Backend Startup",
+    "status": "PASS",
+    "summary": "Backend server running, /api/health OK & OpenAPI /api/docs accessible (200 OK)",
+    "details": {
+      "health": {
+        "status": "ok",
+        "app": "CertiVerify AI - Fake Certificate Detection & Verification System"
+      },
+      "docs_status": 200
+    }
+  },
+  {
+    "area": "Frontend Startup",
+    "status": "PARTIAL",
+    "summary": "Frontend running but some pages non-200",
+    "details": {
+      "home": 500,
+      "dashboard": 500,
+      "compare": 500
+    }
+  },
+  {
+    "area": "Document Upload",
+    "status": "PASS",
+    "summary": "Upload succeeded, group_id: d8e46471-6528-4410-8bca-2393fc25683b, certificate ID: b343bce5-cd49-4811-b972-e40a3e811ee2",
+    "details": {
+      "group_id": "d8e46471-6528-4410-8bca-2393fc25683b",
+      "certificates": [
+        {
+          "id": "b343bce5-cd49-4811-b972-e40a3e811ee2",
+          "original_filename": "degree_cert_1.pdf",
+          "file_type": "pdf",
+          "file_size_bytes": 1829,
+          "sha256_hash": "3682f3a0c803032a8e9e85355159cb1ba9f00c52e62c4637cc67529c519ed9d3",
+          "group_id": "d8e46471-6528-4410-8bca-2393fc25683b",
+          "uploaded_at": "2026-09-11T02:00:15.704049"
+        }
+      ]
+    }
+  },
+  {
+    "area": "OCR Execution",
+    "status": "FAIL",
+    "summary": "OCR exception: timed out",
+    "details": {}
+  },
+  {
+    "area": "OCR Re-execution",
+    "status": "FAIL",
+    "summary": "Repeated OCR returned HTTP 401",
+    "details": {}
+  },
+  {
+    "area": "Document Classification",
+    "status": "PARTIAL",
+    "summary": "Classification returned but predicted_type null/unsupported",
+    "details": {}
+  },
+  {
+    "area": "Field Extraction",
+    "status": "PARTIAL",
+    "summary": "No structured fields extracted from text",
+    "details": {}
+  },
+  {
+    "area": "Verification Pipeline Run",
+    "status": "FAIL",
+    "summary": "run-pipeline endpoint returned HTTP 404",
+    "details": {
+      "resp": "{\"detail\":\"Not Found\"}"
+    }
+  },
+  {
+    "area": "Pipeline Status GET",
+    "status": "FAIL",
+    "summary": "GET pipeline failed (401)",
+    "details": {}
+  },
+  {
+    "area": "Document Comparison (Different Files)",
+    "status": "FAIL",
+    "summary": "Direct compare returned HTTP 401",
+    "details": {
+      "resp": "{\"detail\":\"Could not validate credentials\"}"
+    }
+  },
+  {
+    "area": "Document Comparison (Identical Files)",
+    "status": "FAIL",
+    "summary": "Identical compare failed (401)",
+    "details": {}
+  },
+  {
+    "area": "Error Handling (Insufficient Files)",
+    "status": "FAIL",
+    "summary": "Single file compare returned unexpected HTTP 401",
+    "details": {
+      "resp": "{\"detail\":\"Could not validate credentials\"}"
+    }
+  },
+  {
+    "area": "Database Consistency",
+    "status": "PASS",
+    "summary": "Database clean & consistent. Zero orphaned OCR/Verification records.",
+    "details": {
+      "table_counts": {
+        "users": 4,
+        "certificates": 25,
+        "ocr_data": 17,
+        "document_types": 7,
+        "verification_results": 9,
+        "fraud_analysis": 6,
+        "trust_scores": 6,
+        "final_predictions": 6,
+        "verification_reports": 9
+      },
+      "orphaned_ocr": 0,
+      "orphaned_vr": 0
+    }
+  }
+]

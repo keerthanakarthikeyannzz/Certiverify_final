@@ -1,0 +1,70 @@
+# Frontend
+frontend/node_modules/
+node_modules/
+frontend/.next/
+frontend/out/
+*.tsbuildinfo
+frontend/.env*
+!frontend/.env.example
+
+# Backend
+backend/venv/
+backend/venv_win/
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/**/*.pyc
+**/__pycache__/
+
+# Large Archives & Binaries (>100MB)
+*.zip
+*.tar
+*.tar.gz
+*.rar
+CertiVerify_Phase6_Enterprise.zip
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+
+# Databases & local journals
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Uploads
+backend/uploads/
+uploads/
+
+# Logs
+*.log
+logs/
+
+# Python
+*.pyc
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+powershell.cmd
+
+# Temporary files
+scratch/
+tmp/
+temp/
+
+# IDE
+.vscode/
+.idea/
+# Mac venv and nested clones
+backend/venv_mac/
+**/venv_mac/
+CertiVerify-AI/
+backend/CertiVerify-AI/
