@@ -2,7 +2,7 @@ import requests
 import json
 import os
 
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = os.getenv("BACKEND_URL", f"http://{os.getenv('BACKEND_HOST', os.getenv('HOST', '127.0.0.1'))}:{os.getenv('BACKEND_PORT', os.getenv('PORT', '8000'))}")
 
 import uuid
 

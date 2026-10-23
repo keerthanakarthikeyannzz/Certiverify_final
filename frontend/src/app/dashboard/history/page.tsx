@@ -73,12 +73,14 @@ export default function VerificationHistoryPage() {
   const handleDownloadReport = async (certId: string) => {
     setDownloadingId(certId);
     try {
-      const url = reportApi.downloadUrl(certId);
-      const token = getAccessToken();
-      const directUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url;
-      window.open(directUrl, "_blank");
-    } catch (err) {
+      await reportApi.download(certId);
+    } catch (err: any) {
       console.error("Failed to download report:", err);
+      setToast({
+        type: "error",
+        title: "Download Failed",
+        message: err?.message || "Please ensure the report has been generated in the AI Cockpit.",
+      });
     } finally {
       setDownloadingId(null);
     }

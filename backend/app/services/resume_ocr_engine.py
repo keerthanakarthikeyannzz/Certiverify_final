@@ -64,18 +64,17 @@ def _load_all_pages(file_bytes: bytes, file_type: str) -> list:
     # PyMuPDF at 300 DPI (zoom = 300/72)
     try:
         import fitz
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
         zoom = 300 / 72
         matrix = fitz.Matrix(zoom, zoom)
         pages = []
-        for page_num in range(doc.page_count):
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap(matrix=matrix)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR if pix.n == 4 else cv2.COLOR_RGB2BGR)
-            pages.append(img)
-            logger.info("[Resume] Page %d rendered | shape=%s", page_num, img.shape)
-        doc.close()
+        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+            for page_num in range(doc.page_count):
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(matrix=matrix)
+                img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR if pix.n == 4 else cv2.COLOR_RGB2BGR)
+                pages.append(img)
+                logger.info("[Resume] Page %d rendered | shape=%s", page_num, img.shape)
         if pages:
             return pages
     except ImportError:

@@ -95,12 +95,27 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 # CORS
+is_dev_env = settings.ENV.lower() in ("development", "dev", "test")
+cors_origin_regex = (
+    settings.CORS_ORIGIN_REGEX
+    if settings.CORS_ORIGIN_REGEX is not None
+    else (r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$" if is_dev_env else None)
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origin_regex=cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "Content-Disposition",
+        "Content-Length",
+        "X-Request-ID",
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+    ],
 )
 
 
@@ -147,51 +162,156 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         req_id, request.method, request.url.path,
         _tb.format_exc(),
     )
+    err_detail = "The verification service encountered an internal error. Please try again later."
+    if getattr(settings, "ENVIRONMENT", "development") != "production":
+        err_detail = f"Internal verification error: {str(exc)}"
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "The verification service encountered an internal error. Please try again later."},
+        content={"detail": err_detail, "error": str(exc)},
     )
+
+
+# Component health registry
+component_status = {
+    "ocr_engine": "initializing" if settings.OCR_WARMUP_ENABLED else "disabled",
+    "ocr_detail": None,
+    "blockchain_provider": "disabled",
+    "blockchain_detail": None,
+    "signing_key": "ok",
+    "signing_key_detail": None,
+}
 
 
 @app.on_event("startup")
 async def on_startup():
     settings.validate_production_configuration()
-    await init_db()
     import asyncio as _asyncio
 
-    async def _safe_warmup():
+    # Initialize database
+    try:
+        await init_db()
+    except Exception as exc:
+        logging.getLogger("certiverify.startup").exception("Database initialization failed: %s", exc)
+
+    # Background non-blocking task for heavy component initialization / warmup
+    async def _safe_component_init():
+        startup_logger = logging.getLogger("certiverify.startup")
+
+        # 1. Check report signing key
         try:
-            from app.services.ocr_engine import warmup_easyocr
-            await _asyncio.to_thread(warmup_easyocr)
-        except Exception as _e:
-            logging.getLogger("certiverify.startup").warning(
-                "EasyOCR warmup failed (non-fatal, first OCR call will be slower): %s", _e
-            )
+            async def _check_key():
+                from app.services.report_service import get_report_signing_key
+                key = get_report_signing_key()
+                if getattr(settings, "REPORT_SIGNING_KEY", None):
+                    component_status["signing_key"] = "ok"
+                    component_status["signing_key_detail"] = "Configured"
+                else:
+                    component_status["signing_key"] = "degraded"
+                    component_status["signing_key_detail"] = "Falling back to SECRET_KEY (non-production)"
+            await _asyncio.wait_for(_check_key(), timeout=settings.SIGNING_KEY_CHECK_TIMEOUT_SECONDS)
+        except Exception as exc:
+            startup_logger.exception("Report signing key validation failed: %s", exc)
+            component_status["signing_key"] = "degraded"
+            component_status["signing_key_detail"] = str(exc)
 
-    _asyncio.create_task(_safe_warmup())
+        # 2. Check blockchain provider
+        try:
+            async def _check_blockchain():
+                bc_prov = (getattr(settings, "BLOCKCHAIN_PROVIDER", "") or "none").strip().lower()
+                if bc_prov == "none":
+                    component_status["blockchain_provider"] = "disabled"
+                    component_status["blockchain_detail"] = "Provider set to none"
+                elif bc_prov in ("local_ledger", "local", "ledger"):
+                    component_status["blockchain_provider"] = "ok"
+                    component_status["blockchain_detail"] = f"Local ledger file: {settings.BLOCKCHAIN_LOCAL_LEDGER_PATH}"
+                elif bc_prov in ("evm", "ethereum", "web3"):
+                    from app.services.blockchain_service import get_blockchain_provider
+                    prov = get_blockchain_provider()
+                    w3, contract = prov._get_web3_and_contract()
+                    if contract is not None:
+                        component_status["blockchain_provider"] = "ok"
+                        component_status["blockchain_detail"] = f"Connected to {settings.BLOCKCHAIN_RPC_URL}"
+                    else:
+                        component_status["blockchain_provider"] = "degraded"
+                        component_status["blockchain_detail"] = "RPC unreachable or contract unconfigured"
+                else:
+                    component_status["blockchain_provider"] = "disabled"
+                    component_status["blockchain_detail"] = f"Unknown provider: {bc_prov}"
+            await _asyncio.wait_for(_check_blockchain(), timeout=settings.BLOCKCHAIN_CHECK_TIMEOUT_SECONDS)
+        except Exception as exc:
+            startup_logger.exception("Blockchain provider check failed: %s", exc)
+            component_status["blockchain_provider"] = "degraded"
+            component_status["blockchain_detail"] = str(exc)
+
+        # 3. EasyOCR warmup
+        if not settings.OCR_WARMUP_ENABLED:
+            component_status["ocr_engine"] = "disabled"
+            component_status["ocr_detail"] = "OCR warmup disabled via settings"
+        else:
+            try:
+                from app.services.ocr_engine import warmup_easyocr
+                await _asyncio.wait_for(
+                    _asyncio.to_thread(warmup_easyocr),
+                    timeout=settings.OCR_WARMUP_TIMEOUT_SECONDS
+                )
+                component_status["ocr_engine"] = "ok"
+                component_status["ocr_detail"] = "EasyOCR model loaded and warmed"
+            except Exception as exc:
+                startup_logger.exception("EasyOCR warmup failed: %s", exc)
+                component_status["ocr_engine"] = "degraded"
+                component_status["ocr_detail"] = f"Warmup failed (loads lazily on first OCR call): {exc}"
+
+    _asyncio.create_task(_safe_component_init())
 
 
+@app.get("/health", tags=["System"])
 @app.get("/api/health", tags=["System"])
 async def health_check():
+    """
+    Lightweight liveness probe (no DB, no model inference).
+    Always returns 200 immediately if process is responsive.
+    """
     return {"status": "ok", "app": settings.APP_NAME}
 
 
+@app.get("/health/ready", tags=["System"])
 @app.get("/api/health/ready", tags=["System"])
 async def readiness_check():
     """
-    Lightweight readiness check verifying database and storage availability
-    without invoking expensive OCR or ML inference pipelines.
+    Readiness check verifying database availability and reporting
+    status of optional components (OCR models, blockchain, signing key).
     """
-    status_dict = {"status": "ready", "database": "ok", "storage": "ok"}
+    import asyncio as _asyncio
+    status_dict = {
+        "status": "ready",
+        "app": settings.APP_NAME,
+        "database": "ok",
+        "storage": "ok",
+        "components": {
+            "ocr_engine": component_status.get("ocr_engine", "disabled"),
+            "blockchain_provider": component_status.get("blockchain_provider", "disabled"),
+            "signing_key": component_status.get("signing_key", "ok"),
+        },
+        "details": {
+            "ocr": component_status.get("ocr_detail"),
+            "blockchain": component_status.get("blockchain_detail"),
+            "signing_key": component_status.get("signing_key_detail"),
+        },
+    }
+
+    # Verify database connectivity with timeout
     try:
         from app.db.database import AsyncSessionLocal
         from sqlalchemy import text
-        async with AsyncSessionLocal() as db:
-            await db.execute(text("SELECT 1"))
+        async def _ping_db():
+            async with AsyncSessionLocal() as db:
+                await db.execute(text("SELECT 1"))
+        await _asyncio.wait_for(_ping_db(), timeout=settings.HEALTH_CHECK_TIMEOUT_SECONDS)
     except Exception as exc:
         status_dict["status"] = "unhealthy"
         status_dict["database"] = f"error: {exc}"
 
+    # Verify local/cloud storage path
     try:
         from app.services.storage_service import get_storage_backend
         storage = get_storage_backend()
@@ -201,7 +321,16 @@ async def readiness_check():
         status_dict["status"] = "unhealthy"
         status_dict["storage"] = f"error: {exc}"
 
-    status_code = status.HTTP_200_OK if status_dict["status"] == "ready" else status.HTTP_503_SERVICE_UNAVAILABLE
+    # Surface degraded optional components if DB is healthy
+    if status_dict["status"] == "ready":
+        if any(v == "degraded" for v in status_dict["components"].values()):
+            status_dict["status"] = "degraded"
+
+    status_code = (
+        status.HTTP_200_OK
+        if status_dict["status"] in ("ready", "degraded")
+        else status.HTTP_503_SERVICE_UNAVAILABLE
+    )
     return JSONResponse(status_code=status_code, content=status_dict)
 
 

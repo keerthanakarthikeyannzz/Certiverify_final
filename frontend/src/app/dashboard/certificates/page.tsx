@@ -22,6 +22,7 @@ import {
   CertificateResponse,
   RecentCertificate,
   getAccessToken,
+  reportApi,
 } from "@/lib/api";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
@@ -42,31 +43,11 @@ type FilterStatus = "all" | "genuine" | "suspicious" | "fake" | "inconclusive" |
 
 // ---- Authenticated PDF report downloader -------------------------------------
 async function downloadReport(certId: string, verificationId?: string) {
-  const token = getAccessToken();
-  if (!token) {
-    alert("Please log in first.");
-    return;
+  try {
+    await reportApi.download(certId, verificationId ? `CertiVerify_${verificationId}.pdf` : undefined);
+  } catch (err: any) {
+    alert(`Download failed: ${err.message || "Please ensure the report has been generated in the AI Cockpit."}`);
   }
-
-  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-  const res = await fetch(`${API_URL}/api/v1/certificates/${certId}/download-report`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
-  if (!res.ok) {
-    alert(`Download failed (${res.status}). Verify that the report has been generated in the AI Cockpit.`);
-    return;
-  }
-
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `CertiVerify_${verificationId ?? certId}.pdf`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
 }
 // ------------------------------------------------------------------------------
 

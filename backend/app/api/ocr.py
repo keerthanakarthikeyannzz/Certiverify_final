@@ -1080,13 +1080,5 @@ async def validate_document_fields(
 
 
 async def _get_owned_certificate(certificate_id: str, user: User, db: AsyncSession) -> Certificate:
-    result = await db.execute(
-        select(Certificate).where(Certificate.id == certificate_id)
-    )
-    cert = result.scalar_one_or_none()
-    if not cert:
-        raise HTTPException(status_code=404, detail="Certificate not found.")
-
-    from app.api.deps import verify_tenant_access
-    verify_tenant_access(user, cert.organization_id, cert.owner_id)
-    return cert
+    from app.api.deps import get_owned_certificate
+    return await get_owned_certificate(certificate_id, user, db)

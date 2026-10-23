@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import logging
+
 from fastapi import Depends, HTTPException, status, Request, Query, Header
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,7 +13,26 @@ from app.db.database import get_db
 from app.models.models import User, UserRole
 from app.services.tenant_service import ensure_user_organization
 
+logger = logging.getLogger("certiverify.deps")
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+
+
+def normalize_cert_id(certificate_id: str) -> str:
+    """
+    Normalize a UUID that may arrive with or without hyphens to the
+    canonical no-hyphen form used throughout the database.
+
+    Examples
+    --------
+    >>> normalize_cert_id("5b2a54a9-fcb1-4d07-bd31-8c5ac492c9a1")
+    '5b2a54a9fcb14d07bd318c5ac492c9a1'
+    >>> normalize_cert_id("5b2a54a9fcb14d07bd318c5ac492c9a1")
+    '5b2a54a9fcb14d07bd318c5ac492c9a1'
+    """
+    if certificate_id is None:
+        return certificate_id
+    return certificate_id.replace("-", "").lower()
 
 
 async def get_current_user(
@@ -106,7 +129,8 @@ async def get_current_user_flexible(
 
 
 async def get_current_verified_user(user: User = Depends(get_current_user)) -> User:
-    if not user.is_email_verified:
+    from app.core.config import settings
+    if settings.EMAIL_VERIFICATION_REQUIRED and not user.is_email_verified:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Email not verified. Please verify your email before continuing.",
@@ -117,7 +141,8 @@ async def get_current_verified_user(user: User = Depends(get_current_user)) -> U
 async def get_current_verified_user_flexible(
     user: User = Depends(get_current_user_flexible),
 ) -> User:
-    if not user.is_email_verified:
+    from app.core.config import settings
+    if settings.EMAIL_VERIFICATION_REQUIRED and not user.is_email_verified:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Email not verified. Please verify your email before continuing.",
@@ -187,3 +212,36 @@ def verify_tenant_access(
         detail="Access denied: Resource belongs to another organization",
     )
 
+
+async def get_owned_certificate(
+    certificate_id: str,
+    user: "User",
+    db: "AsyncSession",
+):
+    """
+    Shared helper: look up a Certificate by ID (normalizing any UUID-with-dashes
+    the browser may send), verify ownership/tenant access, and return the row.
+
+    Raises HTTP 404 if not found; HTTP 403 if access is denied.
+    Replaces the duplicate ``_get_owned_certificate`` private functions
+    scattered across api/ocr.py, api/certificates.py, api/pipeline_status.py, etc.
+    """
+    from app.models.models import Certificate  # local import to avoid circular
+
+    normalized = normalize_cert_id(certificate_id)
+    result = await db.execute(
+        select(Certificate).where(Certificate.id == normalized)
+    )
+    cert = result.scalar_one_or_none()
+    if cert is None:
+        logger.warning(
+            "Certificate not found | requested_id=%s normalized=%s user=%s",
+            certificate_id, normalized, user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Certificate not found: {certificate_id}",
+        )
+
+    verify_tenant_access(user, cert.organization_id, cert.owner_id)
+    return cert

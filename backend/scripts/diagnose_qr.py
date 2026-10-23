@@ -8,10 +8,11 @@ import sys
 import io
 import traceback
 
-# Ensure backend root is on sys.path
+# Ensure backend root is on sys.path and default ENV to development for local diagnostic execution
 backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if backend_root not in sys.path:
     sys.path.insert(0, backend_root)
+os.environ.setdefault("ENV", "development")
 
 print("=" * 60)
 print("1. CHECKING IMPORTS")

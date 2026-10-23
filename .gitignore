@@ -8,6 +8,8 @@ frontend/.env*
 !frontend/.env.example
 
 # Backend
+.venv/
+venv/
 backend/venv/
 backend/venv_win/
 backend/.venv/

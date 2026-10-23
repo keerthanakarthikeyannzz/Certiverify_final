@@ -19,18 +19,22 @@ from __future__ import annotations
 from typing import Optional
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.db.database import get_db
 from app.models.models import (
     Certificate, DocumentComparison, DocumentType, FinalPrediction,
     FraudAnalysis, OCRData, TrustScore, User, VerificationReport,
     VerificationResult,
 )
-from app.api.deps import get_current_verified_user
+from app.api.deps import get_current_verified_user, get_owned_certificate, normalize_cert_id
+import logging
+
+logger = logging.getLogger("certiverify.pipeline_status")
 
 router = APIRouter(tags=["Pipeline Status"])
 
@@ -54,9 +58,10 @@ class PipelineStatusResponse(BaseModel):
     filename: str
     file_type: str
     uploaded_at: str
-    overall_status: str             # FULLY_COMPLETE | PARTIALLY_COMPLETE | NOT_STARTED
+    overall_status: str             # FULLY_COMPLETE | PARTIALLY_COMPLETE | NOT_STARTED | PROCESSING
     completion_pct: float           # 0-100
     stages: list[PipelineStage]
+    job_id: Optional[str] = None
 
 
 def _ts(dt: Optional[datetime]) -> Optional[str]:
@@ -83,24 +88,15 @@ async def get_pipeline_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Returns per-stage verification pipeline status for a certificate."""
-    # Ownership check
-    cert_result = await db.execute(
-        select(Certificate).where(
-            Certificate.id == certificate_id,
-            Certificate.owner_id == user.id,
-        )
-    )
-    cert = cert_result.scalar_one_or_none()
-    if cert is None:
-        raise HTTPException(status_code=404, detail="Certificate not found.")
+    cert = await get_owned_certificate(certificate_id, user, db)
 
     # Fetch all related rows in parallel-ish (sequential but cheap)
     doc_type = (await db.execute(
-        select(DocumentType).where(DocumentType.certificate_id == certificate_id).order_by(DocumentType.id.desc())
+        select(DocumentType).where(DocumentType.certificate_id == cert.id).order_by(DocumentType.id.desc())
     )).scalars().first()
 
     ocr = (await db.execute(
-        select(OCRData).where(OCRData.certificate_id == certificate_id).order_by(OCRData.id.desc())
+        select(OCRData).where(OCRData.certificate_id == cert.id).order_by(OCRData.id.desc())
     )).scalars().first()
 
     comparison = None
@@ -111,23 +107,23 @@ async def get_pipeline_status(
         comparison = comparison_res.scalars().first()
 
     vr = (await db.execute(
-        select(VerificationResult).where(VerificationResult.certificate_id == certificate_id).order_by(VerificationResult.id.desc())
+        select(VerificationResult).where(VerificationResult.certificate_id == cert.id).order_by(VerificationResult.id.desc())
     )).scalars().first()
 
     fraud = (await db.execute(
-        select(FraudAnalysis).where(FraudAnalysis.certificate_id == certificate_id).order_by(FraudAnalysis.id.desc())
+        select(FraudAnalysis).where(FraudAnalysis.certificate_id == cert.id).order_by(FraudAnalysis.id.desc())
     )).scalars().first()
 
     trust = (await db.execute(
-        select(TrustScore).where(TrustScore.certificate_id == certificate_id).order_by(TrustScore.id.desc())
+        select(TrustScore).where(TrustScore.certificate_id == cert.id).order_by(TrustScore.id.desc())
     )).scalars().first()
 
     prediction = (await db.execute(
-        select(FinalPrediction).where(FinalPrediction.certificate_id == certificate_id).order_by(FinalPrediction.id.desc())
+        select(FinalPrediction).where(FinalPrediction.certificate_id == cert.id).order_by(FinalPrediction.id.desc())
     )).scalars().first()
 
     report = (await db.execute(
-        select(VerificationReport).where(VerificationReport.certificate_id == certificate_id).order_by(VerificationReport.id.desc())
+        select(VerificationReport).where(VerificationReport.certificate_id == cert.id).order_by(VerificationReport.id.desc())
     )).scalars().first()
 
     # ── Build pipeline stages ────────────────────────────────────────────────
@@ -192,21 +188,30 @@ async def get_pipeline_status(
         vr.qr_present is not None or vr.qr_decoded_data is not None or vr.qr_valid is not None or vr.cross_validation_status is not None
     )
     qr_summary = None
-    if qr_done:
-        if vr.qr_valid is True:
+    qr_status = PENDING
+    if qr_done and vr:
+        if vr.qr_present is False:
+            qr_status = "NOT_APPLICABLE"
+            qr_summary = vr.qr_warning or "No QR Code Detected — Not Applicable"
+        elif vr.qr_valid is True:
             decoded = vr.qr_decoded_data if isinstance(vr.qr_decoded_data, dict) else {}
             cert_no = decoded.get("certificate_id") or decoded.get("certificate_number") or decoded.get("register_number")
-            qr_summary = f"QR Valid ✓{f' ({cert_no})' if cert_no else ''}"
-        elif vr.qr_present and vr.qr_valid is False:
-            qr_summary = "QR Invalid ✗"
-        elif vr.qr_present:
-            qr_summary = "QR Present (Unverified)"
+            qr_type = decoded.get("_qr_type", "detected")
+            qr_summary = f"QR Valid ✓ ({qr_type}){f' [{cert_no}]' if cert_no else ''}"
+            qr_status = COMPLETED
+        elif vr.qr_valid is False:
+            qr_status = FAILED
+            qr_summary = f"QR Invalid ✗{f' ({vr.qr_warning})' if vr.qr_warning else ''}"
         else:
-            qr_summary = "No QR Code Detected ✓"
-    stages.append(_stage(
-        "qr_verification", "QR Verification", qr_done,
-        vr.created_at if vr else None,
-        qr_summary,
+            qr_status = COMPLETED
+            qr_summary = "QR Present (Unverified)"
+
+    stages.append(PipelineStage(
+        stage="qr_verification",
+        label="QR Verification",
+        status=qr_status,
+        completed_at=_ts(vr.created_at if vr and qr_done else None),
+        summary=qr_summary,
     ))
 
     # 7. SHA-256 / Hash Integrity
@@ -226,30 +231,36 @@ async def get_pipeline_status(
     bc_done = vr is not None and vr.blockchain_status is not None
     bc_summary = None
     bc_status = PENDING
-    if bc_done and vr:
-        if vr.blockchain_status == "skipped" or (vr.qr_present is True and vr.qr_valid is True):
-            bc_status = "SKIPPED"
-            bc_summary = "Skipped — Verified via QR"
-        elif vr.blockchain_status == "unavailable":
-            bc_status = UNAVAILABLE
-            bc_summary = "Unavailable"
-        elif vr.blockchain_status == "error":
+    if bc_done and vr and vr.blockchain_status:
+        b_status_upper = vr.blockchain_status.upper()
+        if "NOT_APPLICABLE" in b_status_upper or "UNAVAILABLE" in b_status_upper:
+            bc_status = "NOT_APPLICABLE"
+            bc_summary = "Blockchain Not Configured"
+        elif "UNREACHABLE" in b_status_upper:
             bc_status = FAILED
-            bc_summary = "Error"
-        else:
-            status_txt = vr.blockchain_status.replace("_", " ").title()
-            tx = f" (Tx: {vr.blockchain_tx_hash[:12]}...)" if vr.blockchain_tx_hash else ""
-            bc_summary = f"{status_txt}{tx}"
+            bc_summary = "RPC Unreachable"
+        elif "MISMATCH" in b_status_upper:
+            bc_status = FAILED
+            bc_summary = "Hash Mismatch ✗"
+        elif "NOT_REGISTERED" in b_status_upper:
             bc_status = COMPLETED
-    elif vr and vr.qr_present is True and vr.qr_valid is True:
-        bc_status = "SKIPPED"
-        bc_summary = "Skipped — Verified via QR"
+            bc_summary = "Not Registered (Neutral)"
+        elif "SKIPPED" in b_status_upper:
+            bc_status = "SKIPPED"
+            bc_summary = "Skipped"
+        else:
+            tx = f" (Tx: {vr.blockchain_tx_hash[:10]}...)" if vr.blockchain_tx_hash else ""
+            bc_status = COMPLETED
+            bc_summary = f"Verified: {vr.blockchain_status}{tx}"
+    elif getattr(settings, "BLOCKCHAIN_PROVIDER", "none").lower() == "none":
+        bc_status = "NOT_APPLICABLE"
+        bc_summary = "Blockchain Not Configured"
 
     stages.append(PipelineStage(
         stage="blockchain",
         label="Blockchain Verification",
         status=bc_status,
-        completed_at=_ts(vr.created_at if vr else None),
+        completed_at=_ts(vr.created_at if vr and bc_done else None),
         summary=bc_summary,
     ))
 
@@ -351,107 +362,81 @@ async def get_pipeline_status(
 
 
 @router.post("/api/v1/certificates/{certificate_id}/run-pipeline",
-             response_model=PipelineStatusResponse)
+             response_model=PipelineStatusResponse,
+             status_code=status.HTTP_202_ACCEPTED)
 async def run_entire_pipeline(
     certificate_id: str,
+    sync: bool = Query(default=False, description="Run pipeline synchronously (useful for test suites)"),
     user: User = Depends(get_current_verified_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Executes the sequential verification pipeline end-to-end:
-    Upload -> OCR -> QR Detection -> QR Verification ->
-    If QR Verified -> Genuine / Skip Blockchain & Tampering -> Trust Score
-    If QR Not Verified -> Blockchain -> Tampering -> Trust Score -> Final Classification
+    """Executes the verification pipeline asynchronously (or synchronously if sync=True).
+    Returns HTTP 202 Accepted with job_id immediately so HTTP connections / Next proxy never hang up.
+    Prevents concurrent runs on the same certificate, returning 409 Conflict if already in progress.
     """
     import logging
     logger = logging.getLogger("certiverify.pipeline")
 
-    from app.api.ocr import extract_ocr
-    from app.api.document_type import classify_certificate
-    from app.api.verification import (
-        run_qr_check, run_blockchain_verification, run_tampering_detection, run_duplicate_detection
-    )
-    from app.api.fraud import run_fraud_analysis
-    from app.api.trust_score import run_trust_score
-    from app.api.prediction import run_prediction
-    from app.api.report import generate_report
+    from app.models.models import VerificationJob, JobStatus, PipelineStage as JobPipelineStage
+    from app.services.job_runner import enqueue_verification_job, execute_verification_pipeline
 
-    cert_result = await db.execute(
-        select(Certificate).where(
-            Certificate.id == certificate_id,
-            Certificate.owner_id == user.id,
+    cert = await get_owned_certificate(certificate_id, user, db)
+
+    # Check for active job running on this certificate
+    job_q = await db.execute(
+        select(VerificationJob)
+        .where(
+            VerificationJob.certificate_id == cert.id,
+            VerificationJob.status.in_([JobStatus.PROCESSING, JobStatus.QUEUED, "PROCESSING", "QUEUED"]),
         )
+        .order_by(VerificationJob.created_at.desc(), VerificationJob.id.desc())
     )
-    cert = cert_result.scalar_one_or_none()
-    if cert is None:
-        raise HTTPException(status_code=404, detail="Certificate not found.")
+    latest_job = job_q.scalars().first()
 
-    # 1. OCR Extraction (Must execute first)
-    try:
-        await extract_ocr(certificate_id=cert.id, user=user, db=db)
-    except Exception as exc:
-        logger.exception("Pipeline OCR extraction failed for cert %s: %s", cert.id, exc)
-        return await get_pipeline_status(certificate_id=cert.id, user=user, db=db)
+    stale_timeout = getattr(settings, "JOB_STALE_TIMEOUT_SECONDS", 120)
+    now_utc = datetime.utcnow()
 
-    # 2. Document Classification
-    try:
-        await classify_certificate(certificate_id=cert.id, user=user, db=db)
-    except Exception as exc:
-        logger.exception("Pipeline Document classification failed for cert %s: %s", cert.id, exc)
+    if latest_job and latest_job.status in (JobStatus.PROCESSING, JobStatus.QUEUED):
+        ref_time = latest_job.started_at or latest_job.created_at
+        is_stale = False
+        if ref_time:
+            ref_naive = ref_time.replace(tzinfo=None) if hasattr(ref_time, "tzinfo") and ref_time.tzinfo else ref_time
+            if (now_utc - ref_naive).total_seconds() > stale_timeout:
+                is_stale = True
 
-    # 3. QR Detection & Verification
-    vr_row = None
-    try:
-        vr_row = await run_qr_check(certificate_id=cert.id, user=user, db=db)
-    except Exception as exc:
-        logger.exception("Pipeline QR check failed for cert %s: %s", cert.id, exc)
+        if not is_stale:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"A verification pipeline is already in progress for this certificate (job {latest_job.id}). Please wait for it to complete.",
+            )
+        else:
+            logger.warning("Found stale job %s for cert %s (older than %ds). Recovering and marking FAILED.", latest_job.id, cert.id, stale_timeout)
+            latest_job.status = JobStatus.FAILED
+            latest_job.error_details = f"Stale job recovered after {stale_timeout}s timeout"
+            await db.commit()
 
-    qr_verified = vr_row is not None and vr_row.qr_present is True and vr_row.qr_valid is True
+    # Create a fresh clean VerificationJob
+    new_job = VerificationJob(
+        organization_id=cert.organization_id or user.organization_id,
+        certificate_id=cert.id,
+        status=JobStatus.QUEUED,
+        current_stage=JobPipelineStage.QUEUED,
+        progress_percentage=0,
+        stage_states={},
+    )
+    db.add(new_job)
+    await db.commit()
+    await db.refresh(new_job)
 
-    # 4. Success Path vs Fallback Path
-    if qr_verified:
-        logger.info("QR code verified for cert %s. Skipping Blockchain check.", cert.id)
-        vr_row.blockchain_status = "skipped"
-        await db.commit()
-    else:
-        # Fallback Path: Execute Blockchain check
-        try:
-            await run_blockchain_verification(certificate_id=cert.id, user=user, db=db)
-        except Exception as exc:
-            logger.exception("Pipeline Blockchain verification failed for cert %s: %s", cert.id, exc)
+    if sync:
+        await execute_verification_pipeline(new_job.id)
+        status_resp = await get_pipeline_status(certificate_id=cert.id, user=user, db=db)
+        status_resp.job_id = new_job.id
+        return status_resp
 
-    try:
-        await run_tampering_detection(certificate_id=cert.id, user=user, db=db)
-    except Exception as exc:
-        logger.exception("Pipeline Tampering detection failed for cert %s: %s", cert.id, exc)
-
-    # 5. Duplicate Detection
-    try:
-        await run_duplicate_detection(certificate_id=cert.id, user=user, db=db)
-    except Exception as exc:
-        logger.exception("Pipeline Duplicate detection failed for cert %s: %s", cert.id, exc)
-
-    # 6. Fraud Analysis & Trust Score
-    try:
-        await run_fraud_analysis(certificate_id=cert.id, user=user, db=db)
-    except Exception as exc:
-        logger.exception("Pipeline Fraud analysis failed for cert %s: %s", cert.id, exc)
-
-    try:
-        await run_trust_score(certificate_id=cert.id, user=user, db=db)
-    except Exception as exc:
-        logger.exception("Pipeline Trust score failed for cert %s: %s", cert.id, exc)
-
-    # 7. Final Prediction
-    try:
-        await run_prediction(certificate_id=cert.id, user=user, db=db)
-    except Exception as exc:
-        logger.exception("Pipeline Prediction failed for cert %s: %s", cert.id, exc)
-
-    # 8. Report Generation
-    try:
-        await generate_report(certificate_id=cert.id, user=user, db=db)
-    except Exception as exc:
-        logger.exception("Pipeline Report generation failed for cert %s: %s", cert.id, exc)
-
-    return await get_pipeline_status(certificate_id=cert.id, user=user, db=db)
+    enqueue_verification_job(new_job.id)
+    status_resp = await get_pipeline_status(certificate_id=cert.id, user=user, db=db)
+    status_resp.job_id = new_job.id
+    status_resp.overall_status = "PROCESSING"
+    return status_resp
 

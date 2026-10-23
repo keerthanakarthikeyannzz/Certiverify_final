@@ -3,6 +3,8 @@ import json
 import random
 import os
 
+API_BASE = os.getenv("BACKEND_URL", f"http://{os.getenv('BACKEND_HOST', os.getenv('HOST', '127.0.0.1'))}:{os.getenv('BACKEND_PORT', os.getenv('PORT', '8000'))}")
+
 def test_real_certificate():
     email = f"ev_real_{random.randint(1000,9999)}@example.com"
     password = "StrongPassword123!"
@@ -16,7 +18,7 @@ def test_real_certificate():
     }).encode("utf-8")
     
     req = urllib.request.Request(
-        "http://127.0.0.1:8000/api/v1/auth/register",
+        f"{API_BASE}/api/v1/auth/register",
         data=reg_data,
         headers={"Content-Type": "application/json"}
     )
@@ -28,7 +30,7 @@ def test_real_certificate():
     }).encode("utf-8")
     
     req = urllib.request.Request(
-        "http://127.0.0.1:8000/api/v1/auth/login",
+        f"{API_BASE}/api/v1/auth/login",
         data=login_data,
         headers={"Content-Type": "application/json"}
     )
@@ -57,7 +59,7 @@ def test_real_certificate():
         "Content-Type": f"multipart/form-data; boundary={boundary}"
     }
 
-    req = urllib.request.Request("http://127.0.0.1:8000/api/v1/certificates/upload", data=body, headers=upload_headers)
+    req = urllib.request.Request(f"{API_BASE}/api/v1/certificates/upload", data=body, headers=upload_headers)
     with urllib.request.urlopen(req) as resp:
         res = json.loads(resp.read().decode("utf-8"))
         cert = res["certificates"][0]
@@ -67,10 +69,10 @@ def test_real_certificate():
     # 3. Query all evidence endpoints for real cert BEFORE running verification
     print("\n--- BEFORE Running Verification/OCR ---")
     for name, endpoint in [
-        ("Certificate", f"http://127.0.0.1:8000/api/v1/certificates/{cert_id}"),
-        ("OCR Data", f"http://127.0.0.1:8000/api/v1/certificates/{cert_id}/ocr-data"),
-        ("Verification", f"http://127.0.0.1:8000/api/v1/certificates/{cert_id}/verification"),
-        ("Verification Result", f"http://127.0.0.1:8000/api/v1/certificates/{cert_id}/verification-result"),
+        ("Certificate", f"{API_BASE}/api/v1/certificates/{cert_id}"),
+        ("OCR Data", f"{API_BASE}/api/v1/certificates/{cert_id}/ocr-data"),
+        ("Verification", f"{API_BASE}/api/v1/certificates/{cert_id}/verification"),
+        ("Verification Result", f"{API_BASE}/api/v1/certificates/{cert_id}/verification-result"),
     ]:
         try:
             r = urllib.request.Request(endpoint, headers=headers)
@@ -82,7 +84,7 @@ def test_real_certificate():
 
     # 4. Run /verify-all to populate verification result
     print("\n--- Running /verify-all ---")
-    req = urllib.request.Request(f"http://127.0.0.1:8000/api/v1/certificates/{cert_id}/verify-all", data=b"", headers=headers)
+    req = urllib.request.Request(f"{API_BASE}/api/v1/certificates/{cert_id}/verify-all", data=b"", headers=headers)
     with urllib.request.urlopen(req) as resp:
         v_all = json.loads(resp.read().decode("utf-8"))
         print("verify-all 200 OK | Keys:", list(v_all.keys()))
@@ -90,10 +92,10 @@ def test_real_certificate():
     # 5. Query endpoints AFTER verify-all
     print("\n--- AFTER Running Verification ---")
     for name, endpoint in [
-        ("Certificate", f"http://127.0.0.1:8000/api/v1/certificates/{cert_id}"),
-        ("OCR Data", f"http://127.0.0.1:8000/api/v1/certificates/{cert_id}/ocr-data"),
-        ("Verification", f"http://127.0.0.1:8000/api/v1/certificates/{cert_id}/verification"),
-        ("Verification Result", f"http://127.0.0.1:8000/api/v1/certificates/{cert_id}/verification-result"),
+        ("Certificate", f"{API_BASE}/api/v1/certificates/{cert_id}"),
+        ("OCR Data", f"{API_BASE}/api/v1/certificates/{cert_id}/ocr-data"),
+        ("Verification", f"{API_BASE}/api/v1/certificates/{cert_id}/verification"),
+        ("Verification Result", f"{API_BASE}/api/v1/certificates/{cert_id}/verification-result"),
     ]:
         try:
             r = urllib.request.Request(endpoint, headers=headers)

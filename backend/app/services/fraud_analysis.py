@@ -1,259 +1,580 @@
 """
-MODULE 7 — AI FRAUD ANALYSIS (Enhanced)
+MODULE 5 — AI FRAUD ANALYSIS (fraud_analysis)
 
-Combines every signal produced by Modules 4-6 into a single fraud
-probability (0-1). Pure function over already-computed inputs — no
-new ML model.
+Combines normalized risk signals from earlier verification stages:
+1. OCR accuracy & field extraction confidences
+2. Cross-document comparison (document_comparisons)
+3. QR result (presence, validity, host trust)
+4. Blockchain status (verified, mismatch, not_found, unavailable)
+5. Tampering score & risk level
+6. Duplicate detection (owner distinction, collision, conflict)
+7. Metadata integrity & suspicious editing software flags
+8. Scan image quality (sharpness, resolution, contrast)
 
-ENHANCEMENTS over original:
-  - 3 new input signals: doc_classification_confidence, field_extraction_completeness,
-    text_consistency_score (fills the 10%+10%+missing gap from the spec)
-  - Signature/seal signals added as lightweight indicators
-  - Weights realigned to match spec:
-      OCR=15%, Classification=10%, Fields=10%, Comparison=15%,
-      QR=10%, Blockchain=15%, Tampering=15%, Duplicate=5%, Metadata=5%
-  - Critical evidence overrides (hard floors on fraud_probability):
-      blockchain mismatch  → floor 0.75 (near-conclusive)
-      QR invalid           → floor 0.60
-      tampering ≥ 70       → floor 0.65
-      duplicate            → floor 0.85 (unchanged)
-  - factor_risks now includes all new factors for transparency
-
-Design principles (unchanged from original):
-  - Unavailable signals are EXCLUDED (renormalized), not defaulted to 0.5
-  - Each factor contributes risk in [0, 1] (0=clean, 1=strong fraud indicator)
-  - Hard floor overrides applied after weighted average
+Design Principles:
+- Every signal is mapped to a 0-1 risk value by an explicit normalizer function.
+- Missing signals (e.g. NOT_APPLICABLE, SKIPPED, or unavailable) are EXCLUDED,
+  and the remaining weights are renormalised to sum to 1.0. A missing signal
+  does NOT count as "safe" or "risky".
+- Nominal weights come from application settings / environment variables,
+  mapping 1:1 to the 8 columns of the `fraud_analysis` database table.
+- Configurable hard-floor overrides enforce minimum fraud probabilities on
+  near-conclusive fraud signals (e.g. blockchain mismatch, stolen register number).
+- Detailed per-signal contributions (risk, weight, contribution, status, details)
+  are returned for complete UI explainability.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from app.core.config import settings
 
 
 @dataclass
 class FraudFactorInputs:
-    # ── Existing signals ────────────────────────────────────────────────────
-    ocr_accuracy: float | None = None                   # 0-1
+    # ── 1. OCR Accuracy & Field Confidences ──
+    ocr_accuracy: float | None = None                   # 0-1 or 0-100
+    field_confidences: dict[str, float] | None = None   # field -> 0-1 or 0-100
+
+    # ── 2. Cross-document comparison ──
     comparison_consistency_pct: float | None = None     # 0-100
+
+    # ── 3. QR verification ──
     qr_present: bool | None = None
     qr_valid: bool | None = None
-    blockchain_status: str | None = None                # verified | not_found | mismatch | unavailable
-    tampering_score: float | None = None                # 0-100, higher = more tampering
-    is_duplicate: bool | None = None
-    metadata_flags_present: bool | None = None
-    image_quality_score: float | None = None            # 0-100, higher = better quality
+    qr_warning: str | None = None
 
-    # ── New signals ─────────────────────────────────────────────────────────
-    doc_classification_confidence: float | None = None  # 0-1
-    field_extraction_completeness: float | None = None  # 0-1 (detected/expected fields)
-    text_consistency_score: float | None = None         # 0-1 (internal text coherence)
-    signature_present: bool | None = None               # from OCR has_signature
-    seal_present: bool | None = None                    # from OCR has_seal
-    duplicate_type: str | None = None                   # Priority 7: CERTIFICATE_CONFLICT | DUPLICATE_UPLOAD | etc.
-    duplicate_status: str | None = None                 # own_reupload | suspicious: altered re-upload | ...
-    duplicate_same_owner: bool | None = None            # True when re-upload by same user
+    # ── 4. Blockchain verification ──
+    blockchain_status: str | None = None                # verified | not_found | mismatch | unavailable
+    blockchain_match: bool | None = None
+
+    # ── 5. Tampering analysis ──
+    tampering_score: float | None = None                # 0-100, higher = more tampering
     tampering_risk_level: str | None = None             # LOW | MINOR_ANOMALIES | MODERATE_RISK | HIGH_RISK | VERY_HIGH_RISK
+
+    # ── 6. Duplicate detection ──
+    is_duplicate: bool | None = None
+    duplicate_detail: dict[str, Any] | None = None
+    duplicate_type: str | None = None
+    duplicate_status: str | None = None
+    duplicate_same_owner: bool | None = None
+
+    # ── 7. Metadata integrity ──
+    metadata_flags: list[str] | None = None
+    metadata_flags_present: bool | None = None
+
+    # ── 8. Image quality ──
+    image_quality_score: float | None = None            # 0-100, higher = better quality
+    image_quality_details: dict[str, Any] | None = None
+
+    # Additional contextual indicators
+    doc_classification_confidence: float | None = None
+    field_extraction_completeness: float | None = None
+    text_consistency_score: float | None = None
+    signature_present: bool | None = None
+    seal_present: bool | None = None
+
+
+@dataclass
+class SignalContributionDetail:
+    signal: str
+    label: str
+    is_active: bool
+    nominal_weight: float
+    effective_weight: float
+    risk: float | None
+    contribution: float
+    status: str                                         # CLEAN | WARNING | CRITICAL | NOT_APPLICABLE
+    details: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "signal": self.signal,
+            "label": self.label,
+            "is_active": self.is_active,
+            "nominal_weight": round(self.nominal_weight, 4),
+            "effective_weight": round(self.effective_weight, 4),
+            "risk": round(self.risk, 4) if self.risk is not None else None,
+            "contribution": round(self.contribution, 4),
+            "status": self.status,
+            "details": self.details,
+        }
 
 
 @dataclass
 class FraudAnalysisResult:
-    fraud_probability: float                            # 0-1
-    factor_weights: dict = field(default_factory=dict)  # effective weight per factor
-    factor_risks: dict = field(default_factory=dict)    # raw risk value per factor (0-1)
-    critical_overrides_applied: list[str] = field(default_factory=list)  # which hard floors fired
+    fraud_probability: float                            # 0-1 (post-override)
+    base_probability: float                             # 0-1 (pre-override weighted sum)
+    risk_level: str                                     # LOW | MODERATE | HIGH | VERY_HIGH
+    factor_weights: dict[str, float] = field(default_factory=dict)  # effective weights (8 factors)
+    factor_risks: dict[str, float] = field(default_factory=dict)    # normalized 0-1 risks
+    signal_contributions: list[SignalContributionDetail] = field(default_factory=list)
+    critical_overrides_applied: list[str] = field(default_factory=list)
+    image_quality_details: dict[str, Any] | None = None
 
 
-# Spec-aligned nominal weights (sum = 1.0)
-NOMINAL_WEIGHTS: dict[str, float] = {
-    "ocr_accuracy":              0.15,
-    "doc_classification":        0.10,
-    "field_extraction":          0.10,
-    "comparison":                0.15,
-    "qr":                        0.10,
-    "blockchain":                0.15,
-    "tampering":                 0.15,
-    "duplicate":                 0.05,
-    "metadata_integrity":        0.05,
-    # Note: image_quality and text_consistency have no nominal weight —
-    # they contribute by adjusting existing factor risks rather than
-    # being independent weighted factors, to keep total = 1.0.
+SIGNAL_KEYS = [
+    "ocr_accuracy",
+    "comparison",
+    "qr",
+    "blockchain",
+    "tampering",
+    "duplicate",
+    "metadata_integrity",
+    "image_quality",
+]
+
+SIGNAL_LABELS: dict[str, str] = {
+    "ocr_accuracy": "OCR Extraction & Field Confidences",
+    "comparison": "Cross-Document Comparison Consistency",
+    "qr": "QR Code Verification & Payload Validation",
+    "blockchain": "Blockchain Cryptographic Proof",
+    "tampering": "Tampering & Forgery Detection (ELA/Metadata)",
+    "duplicate": "Duplicate & Credential Collision Detection",
+    "metadata_integrity": "Metadata & Software Provenance Integrity",
+    "image_quality": "Scan Quality (Sharpness/Resolution/Contrast)",
 }
 
-# Hard-floor thresholds for critical evidence overrides
-_BLOCKCHAIN_MISMATCH_FLOOR  = 0.75
-_QR_INVALID_FLOOR           = 0.60
-_TAMPERING_SEVERE_FLOOR     = 0.65
-_TAMPERING_SEVERE_THRESHOLD = 70.0   # tampering_score above which override fires
-_DUPLICATE_FLOOR            = 0.85   # unchanged from original
 
+def get_nominal_weights() -> dict[str, float]:
+    """Load default nominal weights from app settings."""
+    weights = {
+        "ocr_accuracy": getattr(settings, "FRAUD_WEIGHT_OCR_ACCURACY", 0.15),
+        "comparison": getattr(settings, "FRAUD_WEIGHT_COMPARISON", 0.15),
+        "qr": getattr(settings, "FRAUD_WEIGHT_QR", 0.10),
+        "blockchain": getattr(settings, "FRAUD_WEIGHT_BLOCKCHAIN", 0.15),
+        "tampering": getattr(settings, "FRAUD_WEIGHT_TAMPERING", 0.20),
+        "duplicate": getattr(settings, "FRAUD_WEIGHT_DUPLICATE", 0.10),
+        "metadata_integrity": getattr(settings, "FRAUD_WEIGHT_METADATA_INTEGRITY", 0.05),
+        "image_quality": getattr(settings, "FRAUD_WEIGHT_IMAGE_QUALITY", 0.10),
+    }
+    total = sum(weights.values())
+    if total <= 0:
+        return {k: 1.0 / len(weights) for k in weights}
+    return weights
+
+
+# =============================================================================
+# NORMALIZER FUNCTIONS (Signal -> 0-1 Risk)
+# =============================================================================
+
+def normalize_ocr_accuracy(
+    ocr_acc: float | None,
+    field_confidences: dict[str, float] | None,
+) -> tuple[float | None, str]:
+    """
+    Normalizes OCR accuracy and average field extraction confidence into a 0-1 risk.
+    High accuracy (95%+) -> low risk (~0.05). Low accuracy (30%) -> high risk (~0.70).
+    """
+    if ocr_acc is None:
+        return None, "OCR extraction data not available (omitted from risk scoring)"
+
+    acc_val = float(ocr_acc)
+    if acc_val > 1.0:
+        acc_val /= 100.0
+    acc_val = min(max(acc_val, 0.0), 1.0)
+
+    # Blend with field-level extraction confidences if available
+    if field_confidences and isinstance(field_confidences, dict) and len(field_confidences) > 0:
+        confs = []
+        for val in field_confidences.values():
+            if isinstance(val, (int, float)):
+                v = float(val)
+                if v > 1.0:
+                    v /= 100.0
+                confs.append(min(max(v, 0.0), 1.0))
+        if confs:
+            avg_field_conf = sum(confs) / len(confs)
+            effective_acc = 0.70 * acc_val + 0.30 * avg_field_conf
+        else:
+            effective_acc = acc_val
+    else:
+        effective_acc = acc_val
+
+    risk = round(1.0 - effective_acc, 4)
+    details = f"OCR overall accuracy: {round(acc_val * 100, 1)}% (effective score {round(effective_acc * 100, 1)}%)"
+    return risk, details
+
+
+def normalize_comparison(consistency_pct: float | None) -> tuple[float | None, str]:
+    """
+    Normalizes cross-document comparison consistency percentage (0-100) to 0-1 risk.
+    100% consistent -> 0.0 risk. 50% consistent -> 0.5 risk.
+    If no comparison was run (single doc upload), returns None (excluded).
+    """
+    if consistency_pct is None:
+        return None, "Cross-document comparison not applicable (single document upload)"
+
+    c_val = float(consistency_pct)
+    c_val = min(max(c_val, 0.0), 100.0)
+    risk = round(1.0 - (c_val / 100.0), 4)
+    details = f"Cross-document consistency: {round(c_val, 1)}% across sibling records"
+    return risk, details
+
+
+def normalize_qr(
+    present: bool | None,
+    valid: bool | None,
+    warning: str | None,
+) -> tuple[float | None, str]:
+    """
+    Normalizes QR code verification status.
+    If QR code is not present on the document, stage was NOT_APPLICABLE -> None.
+    If QR is valid -> 0.0 risk.
+    If QR is invalid / forged -> 0.85 risk.
+    If QR has warnings (e.g. untrusted domain) -> 0.40 risk.
+    """
+    if present is None or present is False:
+        # A document without a QR code is excluded so it does not count as safe or risky
+        return None, "QR code not present on document (stage not applicable)"
+
+    if valid is True:
+        return 0.0, "QR code payload verified and authenticated"
+    elif valid is False:
+        return 0.85, f"QR code payload invalid or tampered: {warning or 'data mismatch'}"
+    else:
+        return 0.40, f"QR code present with unverified domain or warning: {warning or 'untrusted domain'}"
+
+
+def normalize_blockchain(
+    status: str | None,
+    match: bool | None,
+) -> tuple[float | None, str]:
+    """
+    Normalizes blockchain ledger verification.
+    If blockchain not configured or unavailable -> None (excluded).
+    If verified / match=True -> 0.0 risk.
+    If mismatch / match=False -> 1.0 risk (critical fraud indicator).
+    If not_found -> 0.35 risk (unanchored credential).
+    """
+    if status is None or status.lower() in ("unavailable", "not_applicable", "skipped", "none", ""):
+        return None, "Blockchain verification not configured or unavailable (excluded)"
+
+    st = status.lower()
+    if st == "verified" or match is True:
+        return 0.0, "Cryptographic hash verified on blockchain ledger"
+    elif st == "mismatch" or match is False:
+        return 1.0, "Critical cryptographic hash mismatch against blockchain record"
+    elif st == "not_found":
+        return 0.35, "Document hash not registered on blockchain (unanchored)"
+    else:
+        return 0.35, f"Blockchain verification returned status '{status}'"
+
+
+def normalize_tampering(
+    score: float | None,
+    risk_level: str | None,
+) -> tuple[float | None, str]:
+    """
+    Normalizes tampering score (0-100) directly to 0-1 risk.
+    """
+    if score is None:
+        return None, "Tampering detection not yet executed (excluded)"
+
+    s_val = float(score)
+    risk = round(min(max(s_val / 100.0, 0.0), 1.0), 4)
+    level_str = f" [{risk_level}]" if risk_level else ""
+    details = f"Tampering score: {round(s_val, 1)}/100{level_str}"
+    return risk, details
+
+
+def normalize_duplicate(
+    is_duplicate: bool | None,
+    detail: dict[str, Any] | None,
+) -> tuple[float | None, str]:
+    """
+    Normalizes duplicate detection result, distinguishing same-owner re-upload (benign)
+    from credential collision / identity conflict (severe fraud).
+    """
+    if is_duplicate is None:
+        return None, "Duplicate detection not yet executed (excluded)"
+
+    if not is_duplicate:
+        return 0.0, "No duplicate records found in registry (clean)"
+
+    detail = detail or {}
+    same_owner = bool(
+        detail.get("same_owner")
+        or detail.get("owner_distinction") == "SAME_OWNER_REUPLOAD"
+        or detail.get("duplicate_status") == "own_reupload"
+    )
+    dup_type = (detail.get("duplicate_type") or "").upper()
+    dup_status = (detail.get("duplicate_status") or "").upper()
+    owner_dist = (detail.get("owner_distinction") or "").upper()
+
+    if same_owner:
+        return 0.0, "Re-upload of identical document by original owner (benign re-submission)"
+
+    if dup_type in ("CERTIFICATE_CONFLICT", "IDENTITY_CONFLICT") or dup_status == "CERTIFICATE_CONFLICT":
+        return 1.0, "Identity conflict: same register number issued to a conflicting student name"
+
+    if dup_type == "EXACT_FILE_DUPLICATE" or owner_dist == "DIFFERENT_OWNER_DUPLICATE":
+        return 0.90, "Identical certificate file previously uploaded by a different account"
+
+    if dup_type == "PERCEPTUAL_DUPLICATE_DIFFERENT_OWNER":
+        return 0.85, "Visually identical certificate previously uploaded by a different account"
+
+    if dup_type == "IDENTITY_DUPLICATE_DIFFERENT_OWNER":
+        return 0.90, "Same student registration number and name uploaded by a different user"
+
+    return 0.70, f"Duplicate certificate record detected ({dup_type or 'cross-account match'})"
+
+
+def normalize_metadata_integrity(
+    flags: list[str] | None,
+    flags_present: bool | None,
+) -> tuple[float | None, str]:
+    """
+    Normalizes PDF/image metadata checks (suspicious producers, editing tools, revision anomalies).
+    """
+    if flags is None and flags_present is None:
+        return None, "Metadata integrity check not available (excluded)"
+
+    flag_list = flags or []
+    if not flag_list and not flags_present:
+        return 0.0, "Document metadata is clean; authentic creator/producer signatures"
+
+    # Inspect for suspicious editing tools (Photoshop, Canva, Illustrator, GIMP, etc.)
+    editing_tools = ["photoshop", "canva", "illustrator", "gimp", "coreldraw", "inkscape", "paint.net"]
+    has_editing_sw = any(
+        any(tool in f.lower() for tool in editing_tools)
+        for f in flag_list
+    )
+
+    if has_editing_sw:
+        risk = round(min(0.70 + 0.10 * len(flag_list), 1.0), 4)
+        details = f"Suspicious editing software detected in metadata ({len(flag_list)} flags)"
+    else:
+        risk = round(min(0.35 + 0.10 * len(flag_list), 0.75), 4)
+        details = f"Minor metadata anomalies flagged ({len(flag_list)} signals)"
+
+    return risk, details
+
+
+def normalize_image_quality(
+    score: float | None,
+    details: dict[str, Any] | None,
+) -> tuple[float | None, str]:
+    """
+    Normalizes image scan quality (sharpness, resolution, contrast).
+    High quality scan (90+) -> low risk (~0.10).
+    Degraded, blurry, or washed out scan (25) -> high quality risk (~0.75).
+    """
+    if score is None:
+        return None, "Image quality analysis not available (excluded)"
+
+    q_val = float(score)
+    q_val = min(max(q_val, 0.0), 100.0)
+    risk = round(max(0.0, min(1.0 - (q_val / 100.0), 1.0)), 4)
+
+    parts = [f"Overall scan quality: {round(q_val, 1)}/100"]
+    if details:
+        if details.get("is_blurry"):
+            parts.append("blurry scan")
+        if details.get("is_low_res"):
+            parts.append("low resolution")
+        if details.get("is_low_contrast"):
+            parts.append("low contrast")
+
+    return risk, " | ".join(parts)
+
+
+# =============================================================================
+# FRAUD ANALYSIS ENGINE
+# =============================================================================
 
 def compute_fraud_analysis(inputs: FraudFactorInputs) -> FraudAnalysisResult:
     """
-    Compute fraud probability from all available verification signals.
+    Compute fraud probability from gathered verification signals.
 
-    Returns FraudAnalysisResult with fraud_probability (0-1), per-factor
-    weights actually applied, per-factor risk values, and a list of any
-    critical evidence overrides that were triggered.
+    Excludes missing/NOT_APPLICABLE signals and renormalizes active weights.
+    Applies configurable hard-floor overrides for near-conclusive fraud signals.
     """
-    risks: dict[str, float] = {}
-    overrides: list[str] = []
+    nominal_weights = get_nominal_weights()
 
-    # ── 1. OCR accuracy ─────────────────────────────────────────────────────
-    if inputs.ocr_accuracy is not None:
-        risks["ocr_accuracy"] = round(1.0 - inputs.ocr_accuracy, 4)
+    # Step 1: Normalize all 8 signals
+    raw_risks: dict[str, float | None] = {}
+    details_map: dict[str, str] = {}
 
-    # ── 2. Document classification confidence ────────────────────────────────
-    if inputs.doc_classification_confidence is not None:
-        risks["doc_classification"] = round(1.0 - inputs.doc_classification_confidence, 4)
+    r_ocr, d_ocr = normalize_ocr_accuracy(inputs.ocr_accuracy, inputs.field_confidences)
+    raw_risks["ocr_accuracy"] = r_ocr
+    details_map["ocr_accuracy"] = d_ocr
 
-    # ── 3. Field extraction completeness ────────────────────────────────────
-    if inputs.field_extraction_completeness is not None:
-        risks["field_extraction"] = round(1.0 - inputs.field_extraction_completeness, 4)
+    r_comp, d_comp = normalize_comparison(inputs.comparison_consistency_pct)
+    raw_risks["comparison"] = r_comp
+    details_map["comparison"] = d_comp
 
-    # ── 4. Document comparison ───────────────────────────────────────────────
-    if inputs.comparison_consistency_pct is not None:
-        risks["comparison"] = round(1.0 - inputs.comparison_consistency_pct / 100.0, 4)
+    r_qr, d_qr = normalize_qr(inputs.qr_present, inputs.qr_valid, inputs.qr_warning)
+    raw_risks["qr"] = r_qr
+    details_map["qr"] = d_qr
 
-    # ── 5. QR verification ───────────────────────────────────────────────────
-    if inputs.qr_present is not None:
-        if not inputs.qr_present:
-            # Missing QR is a mild signal only — many real docs have no QR
-            risks["qr"] = 0.20
-        elif inputs.qr_valid:
-            risks["qr"] = 0.0
-        else:
-            risks["qr"] = 0.80
+    r_bc, d_bc = normalize_blockchain(inputs.blockchain_status, inputs.blockchain_match)
+    raw_risks["blockchain"] = r_bc
+    details_map["blockchain"] = d_bc
 
-    # ── 6. Blockchain verification ───────────────────────────────────────────
-    if inputs.blockchain_status is not None and inputs.blockchain_status != "unavailable":
-        blockchain_risk_map = {
-            "verified":  0.0,
-            "not_found": 0.40,   # neutral: not registered ≠ fake
-            "mismatch":  1.0,
-        }
-        risks["blockchain"] = blockchain_risk_map.get(inputs.blockchain_status, 0.40)
+    r_tamp, d_tamp = normalize_tampering(inputs.tampering_score, inputs.tampering_risk_level)
+    raw_risks["tampering"] = r_tamp
+    details_map["tampering"] = d_tamp
 
-    # ── 7. Tampering analysis ────────────────────────────────────────────────
-    if inputs.tampering_score is not None:
-        # Optionally amplify if text_consistency_score also looks bad
-        base_risk = min(inputs.tampering_score / 100.0, 1.0)
-        if inputs.text_consistency_score is not None and inputs.text_consistency_score < 0.5:
-            # Low text consistency independently corroborates tampering
-            base_risk = min(base_risk * 1.10, 1.0)
-        risks["tampering"] = round(base_risk, 4)
+    # Consolidate duplicate inputs
+    dup_detail = inputs.duplicate_detail or {}
+    if inputs.duplicate_type:
+        dup_detail.setdefault("duplicate_type", inputs.duplicate_type)
+    if inputs.duplicate_status:
+        dup_detail.setdefault("duplicate_status", inputs.duplicate_status)
+    if inputs.duplicate_same_owner is not None:
+        dup_detail.setdefault("same_owner", inputs.duplicate_same_owner)
 
-    # ── 8. Duplicate detection (type-aware, Priority 7) ──────────────────────
-    # Different duplicate categories carry different fraud risk:
-    #   CERTIFICATE_CONFLICT   → same cert# but different person: very high risk
-    #   EXACT_FILE_DUPLICATE / DUPLICATE_CERTIFICATE cross-owner → suspicious
-    #   same-owner re-upload (DUPLICATE_UPLOAD) → minimal risk (benign)
-    #   POSSIBLE_DUPLICATE     → moderate warning
-    #   QR_DUPLICATE           → context-dependent (treat as suspicious)
-    #   NO_DUPLICATE / None    → zero risk
-    if inputs.is_duplicate is not None:
-        dup_type = (inputs.duplicate_type or "").upper()
-        dup_status = (inputs.duplicate_status or "").lower()
-        same_owner = bool(inputs.duplicate_same_owner)
-        is_own = dup_status == "own_reupload" or (
-            same_owner and not ("altered" in dup_status or dup_status.startswith("suspicious"))
-            and (dup_type in ("EXACT_FILE_DUPLICATE", "DUPLICATE_UPLOAD") or not dup_type)
-        )
-        is_altered = (
-            "altered" in dup_status
-            or dup_status in ("suspicious: altered re-upload", "suspicious_altered_reupload")
-            or dup_type == "ALTERED_REUPLOAD"
-        )
+    r_dup, d_dup = normalize_duplicate(inputs.is_duplicate, dup_detail)
+    raw_risks["duplicate"] = r_dup
+    details_map["duplicate"] = d_dup
 
-        if not inputs.is_duplicate:
-            risks["duplicate"] = 0.0
-        elif is_own:
-            # Informational only: no penalty, not fraud evidence
-            risks["duplicate"] = 0.0
-        elif is_altered:
-            # Moderate signal
-            risks["duplicate"] = 0.40
-        elif dup_type == "CERTIFICATE_CONFLICT":
-            risks["duplicate"] = 1.0   # Strong fraud signal — always max risk
-        elif dup_type in ("EXACT_FILE_DUPLICATE", "DUPLICATE_CERTIFICATE"):
-            risks["duplicate"] = 0.70
-        elif dup_type == "QR_DUPLICATE":
-            risks["duplicate"] = 0.65
-        elif dup_type == "POSSIBLE_DUPLICATE":
-            risks["duplicate"] = 0.40
-        elif dup_type == "DUPLICATE_UPLOAD":
-            risks["duplicate"] = 0.0 if same_owner else 0.50
-        else:
-            risks["duplicate"] = 0.0 if same_owner else 0.70
+    r_meta, d_meta = normalize_metadata_integrity(inputs.metadata_flags, inputs.metadata_flags_present)
+    raw_risks["metadata_integrity"] = r_meta
+    details_map["metadata_integrity"] = d_meta
 
-    # ── 9. Metadata integrity ────────────────────────────────────────────────
-    if inputs.metadata_flags_present is not None:
-        risks["metadata_integrity"] = 1.0 if inputs.metadata_flags_present else 0.0
+    r_img, d_img = normalize_image_quality(inputs.image_quality_score, inputs.image_quality_details)
+    raw_risks["image_quality"] = r_img
+    details_map["image_quality"] = d_img
 
-    # ── No data at all ───────────────────────────────────────────────────────
-    if not risks:
-        return FraudAnalysisResult(
-            fraud_probability=0.50,
-            factor_weights={},
-            factor_risks={},
-            critical_overrides_applied=["no_data_available"],
-        )
+    # Step 2: Filter active signals and renormalize weights
+    active_keys = [k for k in SIGNAL_KEYS if raw_risks[k] is not None]
+    total_active_nominal = sum(nominal_weights[k] for k in active_keys)
 
-    # ── Renormalized weighted average ────────────────────────────────────────
-    total_nominal = sum(NOMINAL_WEIGHTS.get(f, 0.0) for f in risks)
-    if total_nominal == 0:
-        total_nominal = 1.0
-    effective_weights = {
-        f: NOMINAL_WEIGHTS.get(f, 0.0) / total_nominal for f in risks
-    }
-    probability = sum(effective_weights[f] * risks[f] for f in risks)
+    effective_weights: dict[str, float] = {}
+    signal_contributions: list[SignalContributionDetail] = []
+    factor_risks: dict[str, float] = {}
 
-    # ── Critical evidence overrides (hard floors) ────────────────────────────
-    # DUPLICATE_FLOOR only fires for genuinely suspicious cross-account duplicates.
-    # Same-owner re-uploads are benign and must NOT trigger the floor.
-    if inputs.is_duplicate:
-        dup_type = (inputs.duplicate_type or "").upper()
-        dup_status = (inputs.duplicate_status or "").lower()
-        same_owner = bool(inputs.duplicate_same_owner)
-        is_own = dup_status == "own_reupload" or (
-            same_owner and not ("altered" in dup_status or dup_status.startswith("suspicious"))
-            and (dup_type in ("EXACT_FILE_DUPLICATE", "DUPLICATE_UPLOAD") or not dup_type)
-        )
-        is_altered = (
-            "altered" in dup_status
-            or dup_status in ("suspicious: altered re-upload", "suspicious_altered_reupload")
-            or dup_type == "ALTERED_REUPLOAD"
-        )
+    if total_active_nominal > 0:
+        for k in SIGNAL_KEYS:
+            nom_w = nominal_weights[k]
+            risk_val = raw_risks[k]
+            is_act = risk_val is not None
 
-        if not is_own and not is_altered:
-            is_suspicious_dup = (
-                dup_type == "CERTIFICATE_CONFLICT"
-                or (not same_owner and dup_type in ("EXACT_FILE_DUPLICATE", "DUPLICATE_CERTIFICATE", "QR_DUPLICATE", "POSSIBLE_DUPLICATE"))
-                or (not same_owner)
+            if is_act:
+                eff_w = round(nom_w / total_active_nominal, 4)
+                contribution = round(eff_w * risk_val, 4)
+                factor_risks[k] = risk_val
+
+                # Assign categorical status
+                if risk_val < 0.25:
+                    status = "CLEAN"
+                elif risk_val < 0.60:
+                    status = "WARNING"
+                else:
+                    status = "CRITICAL"
+            else:
+                eff_w = 0.0
+                contribution = 0.0
+                status = "NOT_APPLICABLE"
+
+            effective_weights[k] = eff_w
+            signal_contributions.append(
+                SignalContributionDetail(
+                    signal=k,
+                    label=SIGNAL_LABELS.get(k, k),
+                    is_active=is_act,
+                    nominal_weight=nom_w,
+                    effective_weight=eff_w,
+                    risk=risk_val,
+                    contribution=contribution,
+                    status=status,
+                    details=details_map.get(k, ""),
+                )
             )
-            if is_suspicious_dup:
-                probability = max(probability, _DUPLICATE_FLOOR)
-                overrides.append(f"duplicate_floor_{_DUPLICATE_FLOOR}")
 
-    if inputs.blockchain_status == "mismatch":
-        probability = max(probability, _BLOCKCHAIN_MISMATCH_FLOOR)
-        overrides.append(f"blockchain_mismatch_floor_{_BLOCKCHAIN_MISMATCH_FLOOR}")
+        base_probability = sum(effective_weights[k] * raw_risks[k] for k in active_keys)
+        base_probability = round(min(max(base_probability, 0.0), 1.0), 4)
+    else:
+        # Default neutral fallback if no signals exist
+        base_probability = 0.50
+        for k in SIGNAL_KEYS:
+            effective_weights[k] = 0.0
+            signal_contributions.append(
+                SignalContributionDetail(
+                    signal=k,
+                    label=SIGNAL_LABELS.get(k, k),
+                    is_active=False,
+                    nominal_weight=nominal_weights.get(k, 0.0),
+                    effective_weight=0.0,
+                    risk=None,
+                    contribution=0.0,
+                    status="NOT_APPLICABLE",
+                    details="No verification signal available",
+                )
+            )
 
-    if inputs.qr_present and inputs.qr_valid is False:
-        probability = max(probability, _QR_INVALID_FLOOR)
-        overrides.append(f"qr_invalid_floor_{_QR_INVALID_FLOOR}")
+    # Step 3: Apply Configurable Hard-Override Floors
+    overrides_applied: list[str] = []
+    final_prob = base_probability
 
-    if inputs.tampering_score is not None and inputs.tampering_score >= _TAMPERING_SEVERE_THRESHOLD:
-        probability = max(probability, _TAMPERING_SEVERE_FLOOR)
-        overrides.append(f"tampering_severe_floor_{_TAMPERING_SEVERE_FLOOR}")
+    # 1. Blockchain Mismatch Override
+    if inputs.blockchain_status == "mismatch" or inputs.blockchain_match is False:
+        fl = getattr(settings, "FRAUD_OVERRIDE_BLOCKCHAIN_MISMATCH_FLOOR", 0.85)
+        if final_prob < fl:
+            final_prob = fl
+            overrides_applied.append(f"blockchain_mismatch_floor_{fl}")
 
-    probability = round(min(max(probability, 0.0), 1.0), 4)
+    # 2. Duplicate Collision / Conflict Overrides
+    if inputs.is_duplicate:
+        same_owner = bool(
+            dup_detail.get("same_owner")
+            or dup_detail.get("owner_distinction") == "SAME_OWNER_REUPLOAD"
+            or dup_detail.get("duplicate_status") == "own_reupload"
+        )
+        dup_type = (dup_detail.get("duplicate_type") or "").upper()
+        dup_status = (dup_detail.get("duplicate_status") or "").upper()
+        owner_dist = (dup_detail.get("owner_distinction") or "").upper()
 
-    # Fill zeros for all nominal factors not present (for consistent DB shape)
-    full_weights = {
-        f: round(effective_weights.get(f, 0.0), 4) for f in NOMINAL_WEIGHTS
-    }
+        if dup_type in ("CERTIFICATE_CONFLICT", "IDENTITY_CONFLICT") or dup_status == "CERTIFICATE_CONFLICT":
+            fl = getattr(settings, "FRAUD_OVERRIDE_CONFLICT_FLOOR", 0.90)
+            if final_prob < fl:
+                final_prob = fl
+                overrides_applied.append(f"certificate_conflict_floor_{fl}")
+        elif not same_owner and (
+            owner_dist == "DIFFERENT_OWNER_DUPLICATE"
+            or dup_type in ("EXACT_FILE_DUPLICATE", "DUPLICATE_CERTIFICATE", "PERCEPTUAL_DUPLICATE_DIFFERENT_OWNER")
+        ):
+            fl = getattr(settings, "FRAUD_OVERRIDE_DIFFERENT_OWNER_DUPLICATE_FLOOR", 0.85)
+            if final_prob < fl:
+                final_prob = fl
+                overrides_applied.append(f"different_owner_duplicate_floor_{fl}")
+
+    # 3. Severe Tampering Override
+    tamp_score = inputs.tampering_score
+    if tamp_score is not None:
+        t_thresh = getattr(settings, "FRAUD_OVERRIDE_TAMPERING_THRESHOLD", 70.0)
+        t_floor = getattr(settings, "FRAUD_OVERRIDE_TAMPERING_FLOOR", 0.75)
+        if tamp_score >= t_thresh and final_prob < t_floor:
+            final_prob = t_floor
+            overrides_applied.append(f"tampering_severe_floor_{t_floor}")
+
+    # 4. Invalid QR Code Override
+    if inputs.qr_present is True and inputs.qr_valid is False:
+        qr_fl = getattr(settings, "FRAUD_OVERRIDE_QR_INVALID_FLOOR", 0.65)
+        if final_prob < qr_fl:
+            final_prob = qr_fl
+            overrides_applied.append(f"qr_invalid_floor_{qr_fl}")
+
+    final_prob = round(min(max(final_prob, 0.0), 1.0), 4)
+
+    # Step 4: Derive UI Risk Level
+    if final_prob >= 0.70:
+        risk_level = "VERY_HIGH"
+    elif final_prob >= 0.50:
+        risk_level = "HIGH"
+    elif final_prob >= 0.25:
+        risk_level = "MODERATE"
+    else:
+        risk_level = "LOW"
 
     return FraudAnalysisResult(
-        fraud_probability=probability,
-        factor_weights=full_weights,
-        factor_risks=risks,
-        critical_overrides_applied=overrides,
+        fraud_probability=final_prob,
+        base_probability=base_probability,
+        risk_level=risk_level,
+        factor_weights=effective_weights,
+        factor_risks=factor_risks,
+        signal_contributions=signal_contributions,
+        critical_overrides_applied=overrides_applied,
+        image_quality_details=inputs.image_quality_details,
     )

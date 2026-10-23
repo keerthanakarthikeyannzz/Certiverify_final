@@ -5,14 +5,75 @@ import axios, { AxiosError, InternalAxiosRequestConfig } from "axios";
 //   - CORS preflight failures (same-origin request via proxy)
 //   - IPv4/IPv6 mismatch ("connection refused" on macOS)
 // On the server (SSR/RSC), use the full backend URL for direct communication.
-const API_URL =
-  typeof window === "undefined"
-    ? (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000")
-    : "";
+// Granular backend host and port configuration
+// Default to 127.0.0.1:8000. Never fall back to process.env.PORT because PORT is the frontend's own port.
+const DEFAULT_HOST = process.env.NEXT_PUBLIC_BACKEND_HOST || process.env.BACKEND_HOST || "127.0.0.1";
+const DEFAULT_PORT = process.env.NEXT_PUBLIC_BACKEND_PORT || process.env.BACKEND_PORT || "8000";
+const DEFAULT_BACKEND_URL = `http://${DEFAULT_HOST}:${DEFAULT_PORT}`;
+
+export const BACKEND_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  process.env.NEXT_PUBLIC_BACKEND_URL ||
+  process.env.BACKEND_URL ||
+  DEFAULT_BACKEND_URL;
+
+/**
+ * Loop guard check: validates that the target backend URL does not point
+ * back to the Next.js frontend server itself.
+ */
+export function isBackendLoopingToFrontend(targetUrl: string = BACKEND_URL): boolean {
+  try {
+    const isLocal = (h: string) =>
+      !h ||
+      h === "localhost" ||
+      h === "127.0.0.1" ||
+      h === "0.0.0.0" ||
+      h === "::1" ||
+      h === "[::1]";
+
+    if (typeof window !== "undefined") {
+      const parsed = new URL(targetUrl, window.location.origin);
+      const targetPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+      const currentPort = window.location.port || (window.location.protocol === "https:" ? "443" : "80");
+
+      if (targetPort !== currentPort) return false;
+
+      const targetHost = parsed.hostname.toLowerCase();
+      const currentHost = window.location.hostname.toLowerCase();
+
+      return (isLocal(targetHost) && isLocal(currentHost)) || targetHost === currentHost;
+    } else {
+      const parsed = new URL(targetUrl);
+      const targetPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+      const fePort =
+        process.env.PORT ||
+        process.env.FRONTEND_PORT ||
+        process.env.NEXT_PUBLIC_FRONTEND_PORT ||
+        "3000";
+
+      if (targetPort !== String(fePort)) return false;
+
+      const targetHost = parsed.hostname.toLowerCase();
+      const feHost = (process.env.FRONTEND_HOST || "127.0.0.1").toLowerCase();
+
+      return (isLocal(targetHost) && isLocal(feHost)) || targetHost === feHost;
+    }
+  } catch {
+    return false;
+  }
+}
+
+// In the browser, use a relative base URL so all /api/* requests go through
+// the Next.js rewrite proxy (next.config.js) → backend. This avoids:
+//   - CORS preflight failures (same-origin request via proxy)
+//   - IPv4/IPv6 mismatch ("connection refused" on macOS)
+// On the server (SSR/RSC), use the full backend URL for direct communication.
+const API_URL = typeof window === "undefined" ? BACKEND_URL : "";
 
 // Use this for generating direct href/src URLs (e.g. preview, download).
 // Always use the full backend URL so browser can open links directly.
-const BACKEND_DIRECT_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+export const BACKEND_DIRECT_URL = BACKEND_URL;
 
 export const api = axios.create({ baseURL: API_URL });
 
@@ -28,43 +89,87 @@ export function getRefreshToken(): string | null {
 export function setTokens(access: string, refresh: string) {
   localStorage.setItem("cv_access_token", access);
   localStorage.setItem("cv_refresh_token", refresh);
+  api.defaults.headers.common["Authorization"] = `Bearer ${access}`;
 }
 export function clearTokens() {
   localStorage.removeItem("cv_access_token");
   localStorage.removeItem("cv_refresh_token");
+  delete api.defaults.headers.common["Authorization"];
 }
 
 api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+  if (isBackendLoopingToFrontend(BACKEND_URL)) {
+    const errorMsg = `BACKEND_URL points to the frontend itself: ${BACKEND_URL}`;
+    console.error(`[API LOOP GUARD] Refusing request to avoid self-proxy storm: ${errorMsg}`);
+    return Promise.reject(new Error(errorMsg));
+  }
   const token = getAccessToken();
   if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
 
 let isRefreshing = false;
-let refreshQueue: (() => void)[] = [];
+let refreshSubscribers: ((token: string) => void)[] = [];
+
+function onTokenRefreshed(token: string) {
+  refreshSubscribers.forEach((cb) => cb(token));
+  refreshSubscribers = [];
+}
+
+function addRefreshSubscriber(cb: (token: string) => void) {
+  refreshSubscribers.push(cb);
+}
 
 api.interceptors.response.use(
   (res) => res,
   async (error: AxiosError) => {
     const original = error.config as InternalAxiosRequestConfig & { _retry?: boolean };
-    if (error.response?.status === 401 && !original._retry && getRefreshToken()) {
+    const url = original?.url || "";
+    const isAuthEndpoint = url.includes("/api/v1/auth/refresh") || url.includes("/api/v1/auth/login");
+
+    if (error.response?.status === 401 && !original._retry && !isAuthEndpoint && getRefreshToken()) {
       if (isRefreshing) {
-        await new Promise<void>((resolve) => refreshQueue.push(resolve));
-        return api(original);
+        return new Promise((resolve) => {
+          addRefreshSubscriber((newToken: string) => {
+            if (original.headers) {
+              original.headers.Authorization = `Bearer ${newToken}`;
+            }
+            resolve(api(original));
+          });
+        });
       }
+
       original._retry = true;
       isRefreshing = true;
+
       try {
+        if (isBackendLoopingToFrontend(BACKEND_URL)) {
+          throw new Error(`BACKEND_URL points to the frontend itself: ${BACKEND_URL}`);
+        }
+        const currentRefresh = getRefreshToken();
+        if (!currentRefresh) {
+          throw new Error("No refresh token available");
+        }
+
         const { data } = await axios.post(`${API_URL}/api/v1/auth/refresh`, {
-          refresh_token: getRefreshToken(),
+          refresh_token: currentRefresh,
         });
+
         setTokens(data.access_token, data.refresh_token);
-        refreshQueue.forEach((cb) => cb());
-        refreshQueue = [];
+
+        if (original.headers) {
+          original.headers.Authorization = `Bearer ${data.access_token}`;
+        }
+
+        onTokenRefreshed(data.access_token);
         return api(original);
-      } catch {
+      } catch (refreshErr) {
         clearTokens();
-        if (typeof window !== "undefined") window.location.href = "/login";
+        refreshSubscribers = [];
+        if (typeof window !== "undefined" && window.location.pathname !== "/login") {
+          window.location.href = "/login";
+        }
+        return Promise.reject(refreshErr);
       } finally {
         isRefreshing = false;
       }
@@ -355,6 +460,10 @@ export const directCompareApi = {
       if (docType2) formData.append("doc_type2", docType2);
     }
 
+    if (isBackendLoopingToFrontend(BACKEND_URL)) {
+      throw new Error(`BACKEND_URL points to the frontend itself: ${BACKEND_URL}`);
+    }
+
     const res = await fetch(`${API_URL}/api/v1/direct-compare/pdf`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}` },
@@ -592,18 +701,47 @@ export const fraudApi = {
     api.get<FraudAnalysisResponse>(`/api/v1/certificates/${certificateId}/fraud-analysis`),
 };
 
+export interface TrustComponentBreakdown {
+  component: string;
+  label: string;
+  value: number | null;
+  weight: number;
+  contribution: number;
+  status: string; // 'PASS' | 'WARN' | 'FAIL' | 'not evaluated'
+  reason: string;
+}
+
 export interface TrustScoreResponse {
   id: string;
   certificate_id: string;
   score: number;
+  band?: string; // 'HIGH' | 'MEDIUM' | 'LOW'
+  band_label?: string;
+  coverage?: number; // 0.0 - 1.0 (e.g. 0.75)
+  coverage_percentage?: number; // 0.0 - 100.0 (e.g. 75.0)
+  checks_evaluated?: number;
+  checks_total?: number;
+  components?: TrustComponentBreakdown[];
   breakdown: {
-    weights: Record<string, number>;
-    factor_trust_values: Record<string, number>;
+    score?: number;
+    band?: string;
+    band_label?: string;
+    coverage?: {
+      evaluated: number;
+      total: number;
+      ratio: number;
+      percentage: number;
+      summary: string;
+    };
+    components?: TrustComponentBreakdown[];
+    weights?: Record<string, number>;
+    factor_trust_values?: Record<string, number>;
     evidence_breakdown?: EvidenceBreakdown;
     [key: string]: any;
   };
   created_at: string;
 }
+
 
 export const trustScoreApi = {
   compute: (certificateId: string) =>
@@ -779,6 +917,122 @@ export interface VerificationReportResponse {
   generated_at: string;
 }
 
+export interface ReportListItem {
+  id: string;
+  certificate_id: string;
+  certificate_filename: string;
+  file_type: string;
+  sha256_hash: string;
+  verification_id: string;
+  generated_at: string;
+  digital_signature?: string;
+  pdf_path?: string;
+  prediction_label?: string;
+  trust_score?: number;
+}
+
+export interface SignatureVerificationResponse {
+  is_valid: boolean;
+  verification_id: string;
+  digital_signature?: string;
+  checked_at: string;
+  detail: string;
+}
+
+/**
+ * Shared authenticated report downloader & inline viewer.
+ * Unifies all report download/view buttons across the application:
+ * - Attaches Bearer JWT authentication header
+ * - Requests the download-report endpoint (via Next.js proxy with direct fallback)
+ * - Properly parses and displays server errors (HTTP 4xx/5xx detail) instead of generic alerts
+ * - Extracts clean RFC 5987 filename from Content-Disposition
+ * - In inline mode: opens a blob URL in a new browser tab with application/pdf MIME type
+ * - In download mode: triggers download via an <a> tag and cleans up the object URL safely after 10s
+ */
+export async function downloadOrViewReport(
+  certificateId: string,
+  options?: { inline?: boolean; fallbackFilename?: string }
+): Promise<void> {
+  const token = getAccessToken();
+  const inline = Boolean(options?.inline);
+  
+  const queryStr = inline ? "?inline=true" : "";
+  const endpoint = `/api/v1/certificates/${certificateId}/download-report${queryStr}`;
+  const directEndpoint = `${BACKEND_DIRECT_URL}/api/v1/certificates/${certificateId}/download-report${queryStr}`;
+
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  let res: Response;
+  try {
+    // Attempt through relative rewrite proxy first
+    res = await fetch(endpoint, { headers });
+    // If proxy returned 502/504, try direct endpoint as fallback
+    if (res.status === 502 || res.status === 504) {
+      res = await fetch(directEndpoint, { headers });
+    }
+  } catch {
+    // Fallback to direct backend URL if proxy network failed
+    res = await fetch(directEndpoint, { headers });
+  }
+
+  if (!res.ok) {
+    let errorDetail = `HTTP ${res.status} ${res.statusText}`;
+    try {
+      const errJson = await res.json();
+      if (errJson?.detail) {
+        errorDetail = typeof errJson.detail === "string" ? errJson.detail : JSON.stringify(errJson.detail);
+      }
+    } catch {
+      const errText = await res.text().catch(() => "");
+      if (errText) errorDetail = errText;
+    }
+    throw new Error(errorDetail);
+  }
+
+  const blob = await res.blob();
+  const pdfBlob = new Blob([blob], { type: "application/pdf" });
+  const objectUrl = URL.createObjectURL(pdfBlob);
+
+  if (inline) {
+    const newWindow = window.open(objectUrl, "_blank");
+    if (!newWindow) {
+      window.location.href = objectUrl;
+    }
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+    return;
+  }
+
+  // Extract filename from Content-Disposition header if present
+  let filename = options?.fallbackFilename || `CertiVerify_${certificateId}.pdf`;
+  const disposition = res.headers.get("Content-Disposition");
+  if (disposition) {
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match && utf8Match[1]) {
+      try {
+        filename = decodeURIComponent(utf8Match[1].trim());
+      } catch {
+        filename = utf8Match[1].trim();
+      }
+    } else {
+      const plainMatch = disposition.match(/filename="?([^";]+)"?/i);
+      if (plainMatch && plainMatch[1]) {
+        filename = plainMatch[1].trim();
+      }
+    }
+  }
+
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 10000);
+}
+
 export const reportApi = {
   generate: (certificateId: string) =>
     api.post<VerificationReportResponse>(`/api/v1/certificates/${certificateId}/generate-report`),
@@ -786,6 +1040,14 @@ export const reportApi = {
     api.get<VerificationReportResponse>(`/api/v1/certificates/${certificateId}/report`),
   downloadUrl: (certificateId: string) =>
     `${BACKEND_DIRECT_URL}/api/v1/certificates/${certificateId}/download-report`,
+  download: (certificateId: string, fallbackFilename?: string) =>
+    downloadOrViewReport(certificateId, { inline: false, fallbackFilename }),
+  viewInline: (certificateId: string) =>
+    downloadOrViewReport(certificateId, { inline: true }),
+  list: () =>
+    api.get<ReportListItem[]>("/api/v1/reports"),
+  verifySignature: (certificateId: string) =>
+    api.post<SignatureVerificationResponse>(`/api/v1/certificates/${certificateId}/verify-signature`),
 };
 
 // ---- Module 10 — Dashboard Stats ----
@@ -938,9 +1200,10 @@ export interface PipelineStatusResponse {
   filename: string;
   file_type: string;
   uploaded_at: string;
-  overall_status: "FULLY_COMPLETE" | "PARTIALLY_COMPLETE" | "NOT_STARTED";
+  overall_status: "FULLY_COMPLETE" | "PARTIALLY_COMPLETE" | "NOT_STARTED" | "PROCESSING" | "IN_PROGRESS" | string;
   completion_pct: number;
   stages: PipelineStage[];
+  job_id?: string;
 }
 
 export const pipelineApi = {

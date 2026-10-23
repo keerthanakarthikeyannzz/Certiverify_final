@@ -114,9 +114,8 @@ async def validate_certificate_file(file: UploadFile) -> None:
     if detected_type == "pdf":
         try:
             import fitz  # PyMuPDF
-            doc = fitz.open(stream=contents, filetype="pdf")
-            page_count = doc.page_count
-            doc.close()
+            with fitz.open(stream=contents, filetype="pdf") as doc:
+                page_count = doc.page_count
             if page_count > MAX_PDF_PAGES:
                 raise HTTPException(
                     status_code=400,

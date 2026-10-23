@@ -5,7 +5,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.database import get_db
 from app.models.models import User, Certificate, VerificationJob, JobStatus, PipelineStage
 from app.schemas.job_schemas import JobResponse, JobCreateResponse
-from app.api.deps import get_current_verified_user, verify_tenant_access, require_permission
+from app.api.deps import (
+    get_current_verified_user, verify_tenant_access, require_permission,
+    get_owned_certificate, normalize_cert_id,
+)
 from app.services.job_runner import enqueue_verification_job
 from app.services.audit_service import log_audit_event
 
@@ -30,12 +33,7 @@ async def create_verification_job(
     """
     Enqueues an asynchronous verification job for the certificate and returns HTTP 202 Accepted immediately.
     """
-    cert_res = await db.execute(select(Certificate).where(Certificate.id == certificate_id))
-    cert = cert_res.scalar_one_or_none()
-    if not cert:
-        raise HTTPException(status_code=404, detail="Certificate not found")
-
-    verify_tenant_access(current_user, cert.organization_id, cert.owner_id)
+    cert = await get_owned_certificate(certificate_id, current_user, db)
 
     # Create new VerificationJob entry
     job = VerificationJob(
@@ -120,16 +118,11 @@ async def get_latest_job_for_certificate(
     """
     Retrieves the latest verification job status for a given certificate.
     """
-    cert_res = await db.execute(select(Certificate).where(Certificate.id == certificate_id))
-    cert = cert_res.scalar_one_or_none()
-    if not cert:
-        raise HTTPException(status_code=404, detail="Certificate not found")
-
-    verify_tenant_access(current_user, cert.organization_id, cert.owner_id)
+    cert = await get_owned_certificate(certificate_id, current_user, db)
 
     res = await db.execute(
         select(VerificationJob)
-        .where(VerificationJob.certificate_id == certificate_id)
+        .where(VerificationJob.certificate_id == cert.id)
         .order_by(VerificationJob.created_at.desc())
     )
     job = res.scalars().first()

@@ -73,18 +73,17 @@ def _load_all_pages(file_bytes: bytes, file_type: str) -> list:
     # Try PyMuPDF first (300 DPI)
     try:
         import fitz  # PyMuPDF
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
         pages = []
         zoom = 300 / 72          # 300 DPI
         matrix = fitz.Matrix(zoom, zoom)
-        for page_num in range(doc.page_count):
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap(matrix=matrix)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR if pix.n == 4 else cv2.COLOR_RGB2BGR)
-            pages.append(img)
-            logger.info("[Aadhaar] Page %d rendered via PyMuPDF | shape=%s", page_num, img.shape)
-        doc.close()
+        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+            for page_num in range(doc.page_count):
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(matrix=matrix)
+                img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR if pix.n == 4 else cv2.COLOR_RGB2BGR)
+                pages.append(img)
+                logger.info("[Aadhaar] Page %d rendered via PyMuPDF | shape=%s", page_num, img.shape)
         if pages:
             return pages
     except ImportError:

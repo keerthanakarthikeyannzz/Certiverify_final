@@ -84,7 +84,7 @@ export const ForensicSignalsGrid: React.FC<ForensicSignalsGridProps> = ({
                   qrPresent === undefined
                     ? "text-slate-600 border-slate-200 bg-slate-50"
                     : !qrPresent
-                    ? "text-amber-700 border-amber-200 bg-amber-50"
+                    ? "text-slate-600 border-slate-200 bg-slate-100"
                     : qrStatus
                     ? "text-emerald-700 border-emerald-200 bg-emerald-50"
                     : "text-red-700 border-red-200 bg-red-50"
@@ -93,23 +93,49 @@ export const ForensicSignalsGrid: React.FC<ForensicSignalsGridProps> = ({
                 {qrPresent === undefined
                   ? "PENDING"
                   : !qrPresent
-                  ? "NO QR"
+                  ? "NOT APPLICABLE"
                   : qrStatus
                   ? "VERIFIED"
                   : "INVALID"}
               </span>
             </div>
 
-            <div className="text-xs text-slate-600 space-y-1">
+            <div className="text-xs text-slate-600 space-y-1.5">
               {qrPresent === undefined ? (
                 <p className="text-slate-400">Execute scan to detect digital cryptographic QR.</p>
               ) : !qrPresent ? (
-                <p className="text-slate-500">No QR code detected in document boundaries.</p>
+                <p className="text-slate-500">{qrWarning || "No QR code detected on document (Not Applicable)."}</p>
               ) : (
                 <>
                   <p className={qrStatus ? "text-emerald-700 font-medium" : "text-red-700 font-medium"}>
                     {qrStatus ? "Digital payload signature valid." : "QR payload parsing failed."}
                   </p>
+                  {/* Decoded metadata badges */}
+                  {verification?.qr_decoded_data && typeof verification.qr_decoded_data === "object" && (
+                    <div className="pt-1 flex flex-wrap gap-1 text-[10px]">
+                      {Boolean((verification.qr_decoded_data as Record<string, unknown>)._qr_type) && (
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-slate-600">
+                          {String((verification.qr_decoded_data as Record<string, unknown>)._qr_type).toUpperCase()}
+                        </span>
+                      )}
+                      {Boolean((verification.qr_decoded_data as Record<string, unknown>).host) && (
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-700 max-w-[140px] truncate" title={String((verification.qr_decoded_data as Record<string, unknown>).host)}>
+                          {String((verification.qr_decoded_data as Record<string, unknown>).host)}
+                        </span>
+                      )}
+                      {Boolean((verification.qr_decoded_data as Record<string, unknown>).domain_trust) && (
+                        <span className={`px-1.5 py-0.5 rounded border ${
+                          (verification.qr_decoded_data as Record<string, unknown>).domain_trust === "trusted"
+                            ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                            : (verification.qr_decoded_data as Record<string, unknown>).domain_trust === "untrusted"
+                            ? "bg-red-50 text-red-700 border-red-200"
+                            : "bg-slate-50 text-slate-600 border-slate-200"
+                        }`}>
+                          {String((verification.qr_decoded_data as Record<string, unknown>).domain_trust)}
+                        </span>
+                      )}
+                    </div>
+                  )}
                   {qrWarning && <p className="text-[11px] text-amber-700">⚠ {qrWarning}</p>}
                 </>
               )}
@@ -140,31 +166,49 @@ export const ForensicSignalsGrid: React.FC<ForensicSignalsGridProps> = ({
                 className={`text-[11px] font-semibold px-2 py-0.5 rounded-md border ${
                   !chainStatus
                     ? "text-slate-600 border-slate-200 bg-slate-50"
-                    : chainStatus === "verified"
+                    : chainStatus.toUpperCase().includes("NOT_APPLICABLE") || chainStatus.toLowerCase() === "unavailable"
+                    ? "text-slate-600 border-slate-200 bg-slate-100"
+                    : chainStatus.toUpperCase().includes("MATCH") || chainStatus === "verified"
                     ? "text-emerald-700 border-emerald-200 bg-emerald-50"
-                    : chainStatus === "not_found"
-                    ? "text-amber-700 border-amber-200 bg-amber-50"
+                    : chainStatus.toUpperCase().includes("NOT_REGISTERED") || chainStatus === "not_found"
+                    ? "text-slate-600 border-slate-200 bg-slate-50"
                     : "text-red-700 border-red-200 bg-red-50"
                 }`}
               >
-                {chainStatus ? chainStatus.toUpperCase() : "PENDING"}
+                {!chainStatus
+                  ? "PENDING"
+                  : chainStatus.toUpperCase().includes("NOT_APPLICABLE") || chainStatus.toLowerCase() === "unavailable"
+                  ? "NOT APPLICABLE"
+                  : chainStatus.toUpperCase().includes("MATCH (LOCAL_LEDGER)")
+                  ? "LOCAL LEDGER"
+                  : chainStatus.toUpperCase().includes("MATCH") || chainStatus === "verified"
+                  ? "MATCH"
+                  : chainStatus.toUpperCase().includes("NOT_REGISTERED") || chainStatus === "not_found"
+                  ? "NOT REGISTERED"
+                  : chainStatus.toUpperCase()}
               </span>
             </div>
 
             <div className="text-xs text-slate-600 space-y-1">
               {!chainStatus ? (
                 <p className="text-slate-400">Verify document hash against distributed ledger.</p>
-              ) : chainStatus === "verified" ? (
+              ) : chainStatus.toUpperCase().includes("NOT_APPLICABLE") || chainStatus.toLowerCase() === "unavailable" ? (
+                <p className="text-slate-500">Blockchain provider is unconfigured (Not Applicable).</p>
+              ) : chainStatus.toUpperCase().includes("MATCH") || chainStatus === "verified" ? (
                 <div>
-                  <p className="text-emerald-700 font-medium">Cryptographic hash registered on-chain.</p>
+                  <p className="text-emerald-700 font-medium">Cryptographic hash registered & verified.</p>
                   {verification?.blockchain_tx_hash && (
                     <p className="text-[10px] font-mono text-slate-400 truncate mt-1">
-                      TX: {verification.blockchain_tx_hash.slice(0, 16)}…
+                      TX: {verification.blockchain_tx_hash.slice(0, 18)}…
                     </p>
                   )}
                 </div>
+              ) : chainStatus.toUpperCase().includes("NOT_REGISTERED") || chainStatus === "not_found" ? (
+                <p className="text-slate-500">Hash not found in registry (Recorded neutrally).</p>
+              ) : chainStatus.toUpperCase().includes("UNREACHABLE") ? (
+                <p className="text-red-600">Blockchain network node is unreachable.</p>
               ) : (
-                <p className="text-amber-700">Hash not found or network node unconfigured.</p>
+                <p className="text-red-600">On-chain hash mismatch detected.</p>
               )}
             </div>
           </div>

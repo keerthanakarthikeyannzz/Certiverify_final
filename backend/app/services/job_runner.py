@@ -74,6 +74,10 @@ async def execute_verification_pipeline(job_id: str, is_retry: bool = False):
             await db.commit()
             return
 
+        user_id = user.id
+        cert_id = cert.id
+        org_id = job.organization_id or user.organization_id
+
         job.status = JobStatus.PROCESSING
         if not job.started_at:
             job.started_at = datetime.utcnow()
@@ -125,65 +129,74 @@ async def execute_verification_pipeline(job_id: str, is_retry: bool = False):
 
                 if stage_enum == PipelineStage.DOCUMENT_ANALYSIS:
                     await classify_certificate(cert.id, user, db)
-                    doc_res = await db.execute(select(DocumentType).where(DocumentType.certificate_id == cert.id))
-                    await emit_document_analysis_evidence(db, cert, doc_res.scalar_one_or_none(), verification_job_id=job.id, actor_user_id=user.id)
+                    doc_res = await db.execute(select(DocumentType).where(DocumentType.certificate_id == cert.id).order_by(DocumentType.id.desc()))
+                    await emit_document_analysis_evidence(db, cert, doc_res.scalars().first(), verification_job_id=job.id, actor_user_id=user.id)
 
                 elif stage_enum == PipelineStage.OCR:
-                    await extract_ocr(cert.id, None, user, db)
-                    ocr_res = await db.execute(select(OCRData).where(OCRData.certificate_id == cert.id))
-                    await emit_ocr_evidence(db, cert, ocr_res.scalar_one_or_none(), verification_job_id=job.id, actor_user_id=user.id)
+                    await extract_ocr(certificate_id=cert.id, doc_type=None, force_refresh=False, user=user, db=db)
+                    ocr_res = await db.execute(select(OCRData).where(OCRData.certificate_id == cert.id).order_by(OCRData.id.desc()))
+                    await emit_ocr_evidence(db, cert, ocr_res.scalars().first(), verification_job_id=job.id, actor_user_id=user.id)
 
                 elif stage_enum == PipelineStage.QR_VERIFICATION:
                     await run_qr_check(cert.id, user, db)
-                    vr_res = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == cert.id))
-                    vr_obj = vr_res.scalar_one_or_none()
+                    vr_res = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == cert.id).order_by(VerificationResult.id.desc()))
+                    vr_obj = vr_res.scalars().first()
                     await emit_qr_evidence(db, cert, vr_obj, verification_job_id=job.id, actor_user_id=user.id)
-                    
-                    # If QR code is present and valid, blockchain lookup may be marked optional/skipped,
-                    # but Tampering Analysis MUST always run to check visual forgery/manipulation.
-                    if vr_obj and vr_obj.qr_present and vr_obj.qr_valid:
-                        logger.info("QR code verified for certificate %s. Blockchain marked optional.", cert.id)
-                        if not vr_obj.blockchain_status or vr_obj.blockchain_status == "unavailable":
-                            vr_obj.blockchain_status = "skipped: verified_via_qr"
-                            await db.commit()
 
-                        stage_states[PipelineStage.BLOCKCHAIN_VERIFICATION.value] = {
-                            "status": "SKIPPED",
-                            "label": "Blockchain Verification",
-                            "completed_at": datetime.utcnow().isoformat(),
-                            "details": "Skipped — Verified via QR",
-                        }
+                    if vr_obj and not vr_obj.qr_present:
+                        stage_states[stage_key]["status"] = "NOT_APPLICABLE"
+                        stage_states[stage_key]["details"] = vr_obj.qr_warning or "No QR code detected on document"
+                    elif vr_obj and vr_obj.qr_valid is False:
+                        stage_states[stage_key]["status"] = "FAILED"
+                        stage_states[stage_key]["details"] = vr_obj.qr_warning or "QR validation failed"
+                    else:
+                        stage_states[stage_key]["status"] = "COMPLETED"
+                        stage_states[stage_key]["details"] = "QR verified successfully"
 
                 elif stage_enum == PipelineStage.BLOCKCHAIN_VERIFICATION:
-                    if stage_states.get(stage_key, {}).get("status") == "SKIPPED":
-                        logger.info("Skipping stage %s for job %s (QR verified)", stage_key, job_id)
-                        continue
                     await run_blockchain_verification(cert.id, user, db)
-                    vr_res = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == cert.id))
-                    await emit_blockchain_evidence(db, cert, vr_res.scalar_one_or_none(), verification_job_id=job.id, actor_user_id=user.id)
+                    vr_res = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == cert.id).order_by(VerificationResult.id.desc()))
+                    vr_obj = vr_res.scalars().first()
+                    await emit_blockchain_evidence(db, cert, vr_obj, verification_job_id=job.id, actor_user_id=user.id)
+                    if vr_obj and vr_obj.blockchain_status == "NOT_APPLICABLE":
+                        stage_states[stage_key]["status"] = "NOT_APPLICABLE"
+                        stage_states[stage_key]["details"] = "Blockchain not configured"
+                    elif vr_obj and vr_obj.blockchain_status in ("UNREACHABLE", "MISMATCH"):
+                        stage_states[stage_key]["status"] = "FAILED"
+                        stage_states[stage_key]["details"] = f"Blockchain check failed: {vr_obj.blockchain_status}"
+                    else:
+                        stage_states[stage_key]["status"] = "COMPLETED"
+                        stage_states[stage_key]["details"] = f"Blockchain: {vr_obj.blockchain_status if vr_obj else 'done'}"
 
                 elif stage_enum == PipelineStage.TAMPER_ANALYSIS:
                     await run_tampering_detection(cert.id, user, db)
-                    vr_res = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == cert.id))
-                    await emit_tampering_evidence(db, cert, vr_res.scalar_one_or_none(), verification_job_id=job.id, actor_user_id=user.id)
+                    vr_res = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == cert.id).order_by(VerificationResult.id.desc()))
+                    vr_obj = vr_res.scalars().first()
+                    await emit_tampering_evidence(db, cert, vr_obj, verification_job_id=job.id, actor_user_id=user.id)
 
                 elif stage_enum == PipelineStage.DUPLICATE_DETECTION:
                     await run_duplicate_detection(cert.id, user, db)
-                    vr_res = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == cert.id))
-                    await emit_duplicate_evidence(db, cert, vr_res.scalar_one_or_none(), verification_job_id=job.id, actor_user_id=user.id)
+                    vr_res = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == cert.id).order_by(VerificationResult.id.desc()))
+                    await emit_duplicate_evidence(db, cert, vr_res.scalars().first(), verification_job_id=job.id, actor_user_id=user.id)
 
                 elif stage_enum == PipelineStage.FRAUD_ANALYSIS:
                     await run_fraud_analysis(cert.id, user, db)
-                    fa_res = await db.execute(select(FraudAnalysis).where(FraudAnalysis.certificate_id == cert.id))
-                    await emit_fraud_evidence(db, cert, fa_res.scalar_one_or_none(), verification_job_id=job.id, actor_user_id=user.id)
+                    fa_res = await db.execute(select(FraudAnalysis).where(FraudAnalysis.certificate_id == cert.id).order_by(FraudAnalysis.id.desc()))
+                    await emit_fraud_evidence(db, cert, fa_res.scalars().first(), verification_job_id=job.id, actor_user_id=user.id)
 
                 elif stage_enum == PipelineStage.TRUST_SCORE:
                     await run_trust_score(cert.id, user, db)
-                    ts_res = await db.execute(select(TrustScore).where(TrustScore.certificate_id == cert.id))
-                    await emit_trust_score_evidence(db, cert, ts_res.scalar_one_or_none(), verification_job_id=job.id, actor_user_id=user.id)
+                    ts_res = await db.execute(select(TrustScore).where(TrustScore.certificate_id == cert.id).order_by(TrustScore.id.desc()))
+                    await emit_trust_score_evidence(db, cert, ts_res.scalars().first(), verification_job_id=job.id, actor_user_id=user.id)
                     await run_prediction(cert.id, user, db)
+                    try:
+                        from app.api.report import generate_report
+                        await generate_report(certificate_id=cert.id, user=user, db=db)
+                    except Exception as rep_err:
+                        logger.warning("Auto report generation for job %s had non-fatal error: %s", job_id, rep_err)
 
-                stage_states[stage_key]["status"] = "COMPLETED"
+                if stage_states[stage_key].get("status") not in ("NOT_APPLICABLE", "SKIPPED", "FAILED"):
+                    stage_states[stage_key]["status"] = "COMPLETED"
                 stage_states[stage_key]["completed_at"] = datetime.utcnow().isoformat()
                 job.stage_states = dict(stage_states)
                 await db.commit()
@@ -199,9 +212,18 @@ async def execute_verification_pipeline(job_id: str, is_retry: bool = False):
                 )
 
             # Check for tamper alert
-            vr_check = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == cert.id))
-            vr_obj = vr_check.scalar_one_or_none()
-            if vr_obj and (getattr(vr_obj, "is_tampered", False) or getattr(vr_obj, "tampering_score", 0.0) >= 50.0):
+            vr_check = await db.execute(
+                select(VerificationResult)
+                .where(VerificationResult.certificate_id == cert.id)
+                .order_by(VerificationResult.id.desc())
+            )
+            vr_obj = vr_check.scalars().first()
+            tampering_score_val = getattr(vr_obj, "tampering_score", 0.0) if vr_obj else 0.0
+            if tampering_score_val is None:
+                tampering_score_val = 0.0
+            is_tampered_val = bool(getattr(vr_obj, "is_tampered", False)) if vr_obj else False
+
+            if vr_obj and (is_tampered_val or float(tampering_score_val) >= 50.0):
                 from app.services.webhook_service import dispatch_webhook_event
                 await dispatch_webhook_event(
                     db=db,
@@ -210,15 +232,23 @@ async def execute_verification_pipeline(job_id: str, is_retry: bool = False):
                     payload={
                         "job_id": job.id,
                         "certificate_id": cert.id,
-                        "tampering_score": getattr(vr_obj, "tampering_score", 0.0),
-                        "is_tampered": getattr(vr_obj, "is_tampered", False),
+                        "tampering_score": float(tampering_score_val),
+                        "is_tampered": is_tampered_val,
                     },
                 )
 
             # Check for fraud alert
-            fa_check = await db.execute(select(FraudAnalysis).where(FraudAnalysis.certificate_id == cert.id))
-            fa_obj = fa_check.scalar_one_or_none()
-            if fa_obj and getattr(fa_obj, "fraud_probability", 0.0) >= 0.6:
+            fa_check = await db.execute(
+                select(FraudAnalysis)
+                .where(FraudAnalysis.certificate_id == cert.id)
+                .order_by(FraudAnalysis.id.desc())
+            )
+            fa_obj = fa_check.scalars().first()
+            fraud_prob_val = getattr(fa_obj, "fraud_probability", 0.0) if fa_obj else 0.0
+            if fraud_prob_val is None:
+                fraud_prob_val = 0.0
+
+            if fa_obj and float(fraud_prob_val) >= 0.6:
                 from app.services.webhook_service import dispatch_webhook_event
                 await dispatch_webhook_event(
                     db=db,
@@ -227,7 +257,7 @@ async def execute_verification_pipeline(job_id: str, is_retry: bool = False):
                     payload={
                         "job_id": job.id,
                         "certificate_id": cert.id,
-                        "fraud_probability": getattr(fa_obj, "fraud_probability", 0.0),
+                        "fraud_probability": float(fraud_prob_val),
                         "risk_level": getattr(fa_obj, "risk_level", "HIGH"),
                     },
                 )
@@ -266,8 +296,19 @@ async def execute_verification_pipeline(job_id: str, is_retry: bool = False):
         except Exception as exc:
             import traceback
             tb_str = traceback.format_exc()
-            logger.error("Job %s failed at stage %s: %s\n%s", job_id, job.current_stage, exc, tb_str)
-            failed_stage_name = job.current_stage.value if hasattr(job.current_stage, "value") else str(job.current_stage)
+            logger.error("Job %s failed at stage %s: %s\n%s", job_id, getattr(job, "current_stage", "unknown"), exc, tb_str)
+            failed_stage_name = job.current_stage.value if hasattr(getattr(job, "current_stage", None), "value") else str(getattr(job, "current_stage", "unknown"))
+
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+            res = await db.execute(select(VerificationJob).where(VerificationJob.id == job_id))
+            job = res.scalar_one_or_none()
+            if not job:
+                return
+
             job.status = JobStatus.FAILED
             job.failed_stage = failed_stage_name
 
@@ -281,6 +322,7 @@ async def execute_verification_pipeline(job_id: str, is_retry: bool = False):
 
             job.error_details = err_reason
 
+            stage_states = dict(job.stage_states or {})
             if failed_stage_name in stage_states:
                 stage_states[failed_stage_name]["status"] = "FAILED"
                 stage_states[failed_stage_name]["error"] = err_reason
@@ -292,20 +334,20 @@ async def execute_verification_pipeline(job_id: str, is_retry: bool = False):
                 db,
                 action="verification:failed",
                 entity_type="verification_job",
-                actor_user_id=user.id,
-                organization_id=job.organization_id,
-                entity_id=job.id,
+                actor_user_id=user_id,
+                organization_id=org_id,
+                entity_id=job_id,
                 metadata_json={"failed_stage": failed_stage_name, "error": str(exc)},
             )
 
             from app.services.webhook_service import dispatch_webhook_event
             await dispatch_webhook_event(
                 db=db,
-                organization_id=job.organization_id,
+                organization_id=org_id,
                 event_type="verification.failed",
                 payload={
-                    "job_id": job.id,
-                    "certificate_id": cert.id,
+                    "job_id": job_id,
+                    "certificate_id": cert_id,
                     "failed_stage": failed_stage_name,
                     "error": str(exc),
                 },

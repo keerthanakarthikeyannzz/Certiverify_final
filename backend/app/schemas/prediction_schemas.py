@@ -25,6 +25,8 @@ class FinalPredictionResponse(BaseModel):
     # Enhanced fields (Optional for backward compatibility with stored rows
     # that pre-date this enhancement and don't yet have these columns)
     fraud_probability: Optional[float] = None
+    coverage: Optional[float] = None
+    decision_support_note: Optional[str] = None
     evidence: Optional[dict[str, Any]] = None      # per-factor status breakdown
     reasons: Optional[list[str]] = None            # human-readable bullet list
     verification_summary: Optional[VerificationSummary] = None

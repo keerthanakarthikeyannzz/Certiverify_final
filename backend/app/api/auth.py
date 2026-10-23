@@ -27,6 +27,7 @@ from app.schemas.auth_schemas import (
 )
 from app.services.email_service import send_otp_email, send_password_reset_email
 from app.api.deps import get_current_user
+from app.core.config import settings
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
 
@@ -58,17 +59,33 @@ async def register(
         else:
             role = UserRole.STUDENT
 
+    if role == UserRole.VERIFIER:
+        role = UserRole.UNIVERSITY
+
+    is_verified = not settings.EMAIL_VERIFICATION_REQUIRED
+
     user = User(
         full_name=payload.full_name,
         email=payload.email,
         hashed_password=hash_password(payload.password),
         role=role,
         is_active=True,
-        is_email_verified=True,
+        is_email_verified=is_verified,
     )
     db.add(user)
     await db.commit()
     await db.refresh(user)
+
+    if settings.EMAIL_VERIFICATION_REQUIRED:
+        otp = generate_otp(6)
+        db.add(OTPCode(
+            user_id=user.id,
+            code=otp,
+            purpose=OTPPurpose.EMAIL_VERIFICATION,
+            expires_at=otp_expiry(),
+        ))
+        await db.commit()
+        background_tasks.add_task(send_otp_email, user.email, otp, "email_verification")
 
     return user
 
@@ -77,16 +94,73 @@ async def register(
 # EMAIL VERIFICATION (OTP)
 # ---------------------------------------------------------------------------
 
-@router.post("/verify-email", status_code=status.HTTP_410_GONE)
-async def verify_email():
-    """Email verification via OTP has been removed; users are verified on registration."""
-    raise HTTPException(status_code=410, detail="Email verification is no longer required.")
+@router.post("/verify-email", response_model=UserResponse, status_code=status.HTTP_200_OK)
+async def verify_email(
+    payload: OTPVerifyRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.email == payload.email))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    if user.is_email_verified:
+        return user
+
+    otp_result = await db.execute(
+        select(OTPCode)
+        .where(
+            OTPCode.user_id == user.id,
+            OTPCode.code == payload.code,
+            OTPCode.purpose == OTPPurpose.EMAIL_VERIFICATION,
+            OTPCode.is_used == False,
+        )
+        .order_by(OTPCode.created_at.desc())
+    )
+    otp_record = otp_result.scalars().first()
+    if not otp_record:
+        raise HTTPException(status_code=400, detail="Invalid verification code.")
+
+    exp = otp_record.expires_at
+    now = datetime.now(timezone.utc) if exp.tzinfo is not None else datetime.utcnow()
+    if exp < now:
+        raise HTTPException(status_code=400, detail="Verification code has expired. Please request a new one.")
+
+    otp_record.is_used = True
+    user.is_email_verified = True
+    await db.commit()
+    await db.refresh(user)
+
+    return user
 
 
-@router.post("/resend-otp", status_code=status.HTTP_410_GONE)
-async def resend_otp():
-    """OTP resend has been removed; users are verified on registration."""
-    raise HTTPException(status_code=410, detail="Email verification is no longer required.")
+@router.post("/resend-otp", status_code=status.HTTP_202_ACCEPTED)
+async def resend_otp(
+    payload: ResendOTPRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.email == payload.email))
+    user = result.scalar_one_or_none()
+    if not user:
+        return {"message": "If the account exists, a new verification code has been dispatched."}
+
+    if user.is_email_verified:
+        return {"message": "Account is already verified. You can log in."}
+
+    otp = generate_otp(6)
+    db.add(OTPCode(
+        user_id=user.id,
+        code=otp,
+        purpose=OTPPurpose.EMAIL_VERIFICATION,
+        expires_at=otp_expiry(),
+    ))
+    await db.commit()
+
+    if settings.EMAIL_VERIFICATION_REQUIRED:
+        background_tasks.add_task(send_otp_email, user.email, otp, "email_verification")
+
+    return {"message": "If the account exists, a new verification code has been dispatched."}
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +176,11 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Incorrect email or password.")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="This account has been deactivated.")
+    if settings.EMAIL_VERIFICATION_REQUIRED and not user.is_email_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Email address is not verified. Please verify your account.",
+        )
 
     access_token = create_access_token(subject=user.id, extra_claims={"role": user.role.value})
     refresh_token = create_refresh_token(subject=user.id)

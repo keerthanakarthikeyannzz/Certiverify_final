@@ -121,7 +121,16 @@ export default function CertificateDetailPage() {
       }
       if (dRes.status === "fulfilled") setDocType(dRes.value.data);
       if (valRes.status === "fulfilled") setValidation(valRes.value.data);
-      if (pipeRes.status === "fulfilled") setPipeline(pipeRes.value.data);
+      if (pipeRes.status === "fulfilled") {
+        setPipeline(pipeRes.value.data);
+        setPipelineError(null);
+      } else if (pipeRes.status === "rejected") {
+        const reason = (pipeRes as PromiseRejectedResult).reason;
+        const msg = reason?.response?.data?.detail || reason?.message;
+        if (msg) {
+          setPipelineError(typeof msg === "string" ? msg : JSON.stringify(msg));
+        }
+      }
     } catch (err) {
       console.error("Error refreshing certificate data:", err);
     }
@@ -133,9 +142,10 @@ export default function CertificateDetailPage() {
     try {
       const { data } = await pipelineApi.status(id);
       setPipeline(data);
-    } catch {
+    } catch (err: any) {
       setPipeline(null);
-      setPipelineError("Pipeline status unavailable");
+      const msg = err?.response?.data?.detail || err?.message || "Pipeline status unavailable";
+      setPipelineError(typeof msg === "string" ? msg : JSON.stringify(msg));
     } finally {
       setLoadingPipeline(false);
     }
@@ -238,9 +248,30 @@ export default function CertificateDetailPage() {
     try {
       const { data } = await pipelineApi.runPipeline(id);
       setPipeline(data);
+      // Poll pipeline status until completed or failed
+      let pollCount = 0;
+      const maxPolls = 120; // 120 * 1.5s = 3 minutes max
+      while (pollCount < maxPolls) {
+        await new Promise((r) => setTimeout(r, 1500));
+        pollCount++;
+        try {
+          const { data: statusData } = await pipelineApi.status(id);
+          setPipeline(statusData);
+          if (statusData.overall_status === "FULLY_COMPLETE" || statusData.overall_status === "FAILED") {
+            break;
+          }
+          const pending = statusData.stages.filter((s) => s.status === "PENDING");
+          if (pending.length === 0) {
+            break;
+          }
+        } catch (pollErr) {
+          console.warn("Polling status error:", pollErr);
+        }
+      }
       await refreshAllData();
-    } catch {
-      setPipelineError("Pipeline execution failed. Please retry.");
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail || err?.message;
+      setPipelineError(detail ? (typeof detail === "string" ? detail : JSON.stringify(detail)) : "Pipeline execution failed. Please retry.");
     } finally {
       setRunning(false);
     }
@@ -471,42 +502,56 @@ async function handleGenerateReport() {
     const { data } = await reportApi.generate(id);
     setReport(data);
     await loadPipeline();
-  } catch {
-    setError("Report generation failed. Ensure at least OCR and Final Prediction have been run.");
+  } catch (err: any) {
+    const detail = err?.response?.data?.detail || err?.message;
+    setError(detail ? `Report generation failed: ${detail}` : "Report generation failed. Ensure at least OCR and Final Prediction have been run.");
   } finally {
     setGeneratingReport(false);
   }
 }
 
-// Authenticated download — uses fetch() + Bearer token so the backend JWT
-// check passes. A plain <a href> or window.open sends NO auth header → 401.
+// Authenticated download — delegates to shared reportApi helper with JWT
 async function handleDownloadReport() {
-  if (!report) return;
-  setDownloadingReport(true);
-  try {
-    const token = getAccessToken();
-    const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-    const res = await fetch(`${API_URL}/api/v1/certificates/${id}/download-report`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!res.ok) {
-      setError(`Download failed (${res.status}). Please regenerate the report.`);
+  if (!report) {
+    // If not generated yet, attempt auto-generation first
+    try {
+      await handleGenerateReport();
+    } catch {
       return;
     }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `CertiVerify_${report.verification_id}.pdf`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  } catch {
-    setError("Download failed. Please try again.");
+  }
+  setDownloadingReport(true);
+  setError(null);
+  try {
+    await reportApi.download(id, report ? `CertiVerify_${report.verification_id}.pdf` : undefined);
+  } catch (err: any) {
+    setError(`Download failed: ${err.message || "Please check backend logs and try again."}`);
   } finally {
     setDownloadingReport(false);
   }
+}
+
+// View Full Report — opens PDF inline in a new tab if report is ready, or jumps to dossier
+async function handleViewFullReport() {
+  if (report) {
+    setDownloadingReport(true);
+    setError(null);
+    try {
+      await reportApi.viewInline(id);
+    } catch (err: any) {
+      setError(`View report failed: ${err.message || "Unable to display PDF inline."}`);
+    } finally {
+      setDownloadingReport(false);
+    }
+    return;
+  }
+
+  // If no report generated yet, navigate to verification report section
+  setActiveTab("cockpit");
+  setTimeout(() => {
+    const el = document.getElementById("verification-report-section");
+    if (el) el.scrollIntoView({ behavior: "smooth" });
+  }, 100);
 }
 
   if (!cert && error) {
@@ -608,13 +653,7 @@ async function handleDownloadReport() {
           validation={validation}
           report={report}
           cert={cert}
-          onViewReport={() => {
-            setActiveTab("cockpit");
-            setTimeout(() => {
-              const el = document.getElementById("verification-report-section");
-              if (el) el.scrollIntoView({ behavior: "smooth" });
-            }, 100);
-          }}
+          onViewReport={handleViewFullReport}
           onDownloadReport={handleDownloadReport}
           downloadingReport={downloadingReport}
         />
@@ -719,10 +758,7 @@ async function handleDownloadReport() {
           validation={validation}
           report={report}
           cert={cert}
-          onViewReport={() => {
-            const el = document.getElementById("verification-report-section");
-            if (el) el.scrollIntoView({ behavior: "smooth" });
-          }}
+          onViewReport={handleViewFullReport}
           onDownloadReport={handleDownloadReport}
           downloadingReport={downloadingReport}
         />

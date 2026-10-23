@@ -1,40 +1,15 @@
 "use client";
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { authApi } from "@/lib/api";
-import { AxiosError } from "axios";
+import { authApi, setTokens } from "@/lib/api";
+import { formatErrorMessage, isBackendUnreachableError } from "@/lib/errorHandler";
 import { Logo } from "@/components/ui/Logo";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
+import { ConnectionStatus } from "@/components/ui/ConnectionStatus";
 import { AlertCircle, Check } from "lucide-react";
-
-function extractErrorMessage(err: unknown): string {
-  if (!err) return "Registration failed. Please try again.";
-  const axErr = err as AxiosError<{ detail?: unknown; message?: string }>;
-  if (!axErr.response) {
-    if (axErr.message?.includes("Network Error") || axErr.code === "ERR_NETWORK") {
-      return "Unable to connect to authentication server. Please ensure the backend is running.";
-    }
-    return axErr.message || "Network error. Please verify your connection.";
-  }
-
-  const status = axErr.response.status;
-  const detail = axErr.response.data?.detail;
-
-  if (typeof detail === "string") return detail;
-  if (Array.isArray(detail) && detail.length > 0) {
-    const first = detail[0] as { msg?: string; loc?: string[] };
-    const raw = first?.msg || "Validation error";
-    return raw.replace(/^Value error,\s*/i, "");
-  }
-
-  if (status === 409) return "An account with this email already exists.";
-  if (status >= 500) return "Server error encountered. Please try again later.";
-
-  return "Registration failed. Please try again.";
-}
 
 function validatePassword(pw: string): string | null {
   if (pw.length < 8) return "Password must be at least 8 characters.";
@@ -48,6 +23,18 @@ export default function RegisterPage() {
   const [form, setForm] = useState({ full_name: "", email: "", password: "", role: "student" });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  // Auto-clear connection error when backend status becomes online
+  useEffect(() => {
+    const handleStatus = (e: Event) => {
+      const customEvent = e as CustomEvent<{ online: boolean }>;
+      if (customEvent.detail?.online && error && error.includes("Can't reach the verification server")) {
+        setError(null);
+      }
+    };
+    window.addEventListener("backend-status-change", handleStatus);
+    return () => window.removeEventListener("backend-status-change", handleStatus);
+  }, [error]);
 
   const hasLength = form.password.length >= 8;
   const hasUpper = /[A-Z]/.test(form.password);
@@ -85,9 +72,19 @@ export default function RegisterPage() {
         password: form.password,
         role: form.role,
       });
-      router.push(`/verify-email?email=${encodeURIComponent(trimmedEmail)}`);
+
+      try {
+        const { data } = await authApi.login({
+          email: trimmedEmail,
+          password: form.password,
+        });
+        setTokens(data.access_token, data.refresh_token);
+        router.push("/dashboard/upload");
+      } catch {
+        router.push("/login?registered=1");
+      }
     } catch (err) {
-      setError(extractErrorMessage(err));
+      setError(formatErrorMessage(err, "Registration failed. Please try again."));
     } finally {
       setLoading(false);
     }
@@ -102,10 +99,13 @@ export default function RegisterPage() {
           <p className="text-xs text-slate-500 max-w-xs">
             Start verifying academic and institutional credentials with tamper detection.
           </p>
+          <div className="pt-1">
+            <ConnectionStatus />
+          </div>
         </div>
 
         {error && (
-          <div className="flex items-start gap-2 p-3 bg-red-50 border border-red-200 text-red-800 rounded-lg text-xs">
+          <div className="flex items-start gap-2 p-3 bg-red-50 border border-red-200 text-red-800 rounded-lg text-xs leading-relaxed">
             <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
             <span>{error}</span>
           </div>
@@ -128,62 +128,68 @@ export default function RegisterPage() {
             type="email"
             required
             autoComplete="email"
-            placeholder="jane@university.edu"
+            placeholder="jane.doe@university.edu"
             value={form.email}
             onChange={(e) => setForm({ ...form, email: e.target.value })}
           />
 
+          <Input
+            id="password-input"
+            label="Password"
+            type="password"
+            required
+            autoComplete="new-password"
+            placeholder="Min 8 chars, 1 uppercase, 1 digit"
+            value={form.password}
+            onChange={(e) => setForm({ ...form, password: e.target.value })}
+          />
+
+          <div className="bg-slate-50 border border-slate-100 rounded-lg p-3 space-y-1.5 text-xs">
+            <p className="font-semibold text-slate-600 text-[11px] uppercase tracking-wider">Password Requirements</p>
+            <div className="flex items-center gap-2">
+              <div className={`w-3.5 h-3.5 rounded-full flex items-center justify-center text-[10px] ${hasLength ? "bg-emerald-500 text-white" : "bg-slate-200 text-slate-400"}`}>
+                <Check className="w-2.5 h-2.5 stroke-[3]" />
+              </div>
+              <span className={hasLength ? "text-emerald-700 font-medium" : "text-slate-500"}>At least 8 characters</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className={`w-3.5 h-3.5 rounded-full flex items-center justify-center text-[10px] ${hasUpper ? "bg-emerald-500 text-white" : "bg-slate-200 text-slate-400"}`}>
+                <Check className="w-2.5 h-2.5 stroke-[3]" />
+              </div>
+              <span className={hasUpper ? "text-emerald-700 font-medium" : "text-slate-500"}>At least one uppercase letter (A–Z)</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className={`w-3.5 h-3.5 rounded-full flex items-center justify-center text-[10px] ${hasNumber ? "bg-emerald-500 text-white" : "bg-slate-200 text-slate-400"}`}>
+                <Check className="w-2.5 h-2.5 stroke-[3]" />
+              </div>
+              <span className={hasNumber ? "text-emerald-700 font-medium" : "text-slate-500"}>At least one number (0–9)</span>
+            </div>
+          </div>
+
           <Select
             id="role-select"
-            label="Account Role"
+            label="Role in Organization"
             value={form.role}
             onChange={(e) => setForm({ ...form, role: e.target.value })}
             options={[
-              { value: "student", label: "Student / Graduate" },
-              { value: "verifier", label: "Employer / Background Verifier" },
-              { value: "issuer", label: "Academic Registrar / Issuer" },
+              { value: "student", label: "Student / Candidate" },
+              { value: "issuer", label: "Issuing Authority (University / Board)" },
+              { value: "verifier", label: "Third-party Verifier (Employer / Embassy)" },
+              { value: "admin", label: "Compliance & Security Admin" },
             ]}
           />
 
-          <div className="space-y-1.5">
-            <Input
-              id="password-input"
-              label="Password"
-              type="password"
-              required
-              autoComplete="new-password"
-              placeholder="••••••••"
-              value={form.password}
-              onChange={(e) => setForm({ ...form, password: e.target.value })}
-            />
-            {form.password.length > 0 && (
-              <div className="grid grid-cols-3 gap-1 pt-1 text-[11px]">
-                <div className={`flex items-center gap-1 ${hasLength ? "text-emerald-700" : "text-slate-400"}`}>
-                  <Check className="w-3 h-3" /> 8+ chars
-                </div>
-                <div className={`flex items-center gap-1 ${hasUpper ? "text-emerald-700" : "text-slate-400"}`}>
-                  <Check className="w-3 h-3" /> Uppercase
-                </div>
-                <div className={`flex items-center gap-1 ${hasNumber ? "text-emerald-700" : "text-slate-400"}`}>
-                  <Check className="w-3 h-3" /> Number
-                </div>
-              </div>
-            )}
-          </div>
-
-          <Button type="submit" loading={loading} disabled={loading} className="w-full">
+          <Button type="submit" variant="primary" className="w-full mt-2" loading={loading}>
             Create Account
           </Button>
         </form>
 
-        <div className="text-center pt-2 border-t border-slate-100">
-          <p className="text-xs text-slate-500">
-            Already have an account?{" "}
-            <Link href="/login" className="font-semibold text-indigo-600 hover:text-indigo-700 hover:underline">
-              Sign in
-            </Link>
-          </p>
-        </div>
+        <p className="text-center text-xs text-slate-500">
+          Already registered?{" "}
+          <Link href="/login" className="text-indigo-600 font-medium hover:underline">
+            Sign in here
+          </Link>
+        </p>
       </div>
     </main>
   );

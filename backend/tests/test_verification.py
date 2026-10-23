@@ -85,7 +85,7 @@ def test_qr_garbage_content_rejected():
 
 def test_blockchain_verification_unavailable_when_unconfigured():
     # No CONTRACT_ADDRESS / provider configured in the test environment ->
-    # must degrade gracefully to "unavailable", never raise or 500.
+    # must degrade gracefully to NOT_APPLICABLE / unavailable, never raise or 500.
     result = verify_hash_onchain("a" * 64)
-    assert result.status == "unavailable"
+    assert result.status in ("unavailable", "NOT_APPLICABLE")
     assert result.match is None

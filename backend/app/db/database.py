@@ -27,15 +27,25 @@ def _normalize_db_url(db_url: str) -> str:
 def _create_engine_and_session(db_url: str):
     db_url = _normalize_db_url(db_url)
     connect_args = {}
+    engine_kwargs = {
+        "echo": settings.DEBUG,
+        "future": True,
+    }
     if db_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
         connect_args["timeout"] = 60.0
+    else:
+        # PostgreSQL asyncpg connection pool configuration
+        engine_kwargs["pool_pre_ping"] = getattr(settings, "DB_POOL_PRE_PING", True)
+        engine_kwargs["pool_size"] = getattr(settings, "DB_POOL_SIZE", 20)
+        engine_kwargs["max_overflow"] = getattr(settings, "DB_MAX_OVERFLOW", 10)
+        engine_kwargs["pool_recycle"] = getattr(settings, "DB_POOL_RECYCLE_SECONDS", 1800)
+        engine_kwargs["pool_timeout"] = getattr(settings, "DB_POOL_TIMEOUT_SECONDS", 30)
 
     eng = create_async_engine(
         db_url,
-        echo=settings.DEBUG,
-        future=True,
         connect_args=connect_args,
+        **engine_kwargs,
     )
 
     if db_url.startswith("sqlite"):

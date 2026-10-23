@@ -15,6 +15,7 @@ from app.db.database import get_db
 from app.models.models import (
     User, Certificate, DocumentType, OCRData, DocumentComparison,
     VerificationResult, FraudAnalysis, TrustScore, FinalPrediction, PredictionLabel,
+    VerificationJob, JobStatus, AuditLog,
 )
 from datetime import datetime
 from app.schemas.prediction_schemas import (
@@ -97,36 +98,49 @@ async def submit_certificate_review(
     )
 
 
-@router.post("/{certificate_id}/predict", response_model=FinalPredictionResponse)
-@router.post("/{certificate_id}/prediction", response_model=FinalPredictionResponse, include_in_schema=False)
-async def run_prediction(
-    certificate_id: str,
-    user: User = Depends(get_current_verified_user),
-    db: AsyncSession = Depends(get_db),
+async def _gather_prediction_inputs(
+    cert: Certificate,
+    user: User,
+    db: AsyncSession,
+    auto_run_prereqs: bool = False,
 ):
-    cert = await _get_owned_certificate(certificate_id, user, db)
-
     doc_type_row = await _fetch_one(db, DocumentType, DocumentType.certificate_id == cert.id)
     ocr_row = await _fetch_one(db, OCRData, OCRData.certificate_id == cert.id)
     verification_row = await _fetch_one(db, VerificationResult, VerificationResult.certificate_id == cert.id)
     fraud_row = await _fetch_one(db, FraudAnalysis, FraudAnalysis.certificate_id == cert.id)
-    if fraud_row is None:
+
+    if fraud_row is None and auto_run_prereqs:
         from app.api.fraud import run_fraud_analysis
-        fraud_row = await run_fraud_analysis(certificate_id, user, db)
+        await run_fraud_analysis(cert.id, user, db)
+        fraud_row = await _fetch_one(db, FraudAnalysis, FraudAnalysis.certificate_id == cert.id)
 
     trust_row = await _fetch_one(db, TrustScore, TrustScore.certificate_id == cert.id)
-    if trust_row is None:
+    if trust_row is None and auto_run_prereqs:
         from app.api.trust_score import run_trust_score
-        trust_row = await run_trust_score(certificate_id, user, db)
+        await run_trust_score(cert.id, user, db)
+        trust_row = await _fetch_one(db, TrustScore, TrustScore.certificate_id == cert.id)
 
     comparison_row = None
     if cert.group_id:
         comparison_row = await _fetch_one(db, DocumentComparison, DocumentComparison.group_id == cert.group_id)
 
-    data_completeness = _compute_data_completeness(trust_row)
+    data_completeness = _compute_data_completeness(trust_row) if trust_row else 0.0
 
-    # Pull evidence_breakdown stored by trust score engine
-    ts_breakdown = trust_row.breakdown or {}
+    ts_breakdown = (trust_row.breakdown or {}) if trust_row else {}
+    cov_val = ts_breakdown.get("coverage")
+    if isinstance(cov_val, dict):
+        coverage = float(cov_val.get("ratio", 0.0))
+        checks_evaluated = int(cov_val.get("evaluated", 0))
+        checks_total = int(cov_val.get("total", 8))
+    elif isinstance(cov_val, (int, float)):
+        coverage = float(cov_val)
+        checks_evaluated = ts_breakdown.get("checks_evaluated")
+        checks_total = ts_breakdown.get("checks_total", 8)
+    else:
+        coverage = None
+        checks_evaluated = ts_breakdown.get("checks_evaluated")
+        checks_total = ts_breakdown.get("checks_total", 8)
+    components = ts_breakdown.get("components")
     evidence_breakdown = ts_breakdown.get("evidence_breakdown")
 
     dup_detail = (verification_row.duplicate_detail or {}) if verification_row else {}
@@ -136,55 +150,142 @@ async def run_prediction(
     dup_reason = verification_row.duplicate_match_reason if verification_row else None
 
     inputs = PredictionInputs(
-        trust_score=trust_row.score,
+        trust_score=trust_row.score if trust_row else 0.0,
         data_completeness=data_completeness,
+        coverage=coverage,
+        checks_evaluated=checks_evaluated,
+        checks_total=checks_total,
+        components=components,
         is_duplicate=verification_row.is_duplicate if verification_row else None,
         duplicate_status=dup_status,
         duplicate_same_owner=dup_same_owner,
         duplicate_type=dup_type,
         duplicate_match_reason=dup_reason,
+        duplicate_detail=dup_detail,
         tampering_score=verification_row.tampering_score if verification_row else None,
         tampering_status=verification_row.tampering_status if verification_row else None,
+        tampering_risk_level=verification_row.tampering_risk_level if verification_row else None,
         blockchain_status=verification_row.blockchain_status if verification_row else None,
+        blockchain_match=verification_row.blockchain_match if verification_row else None,
         qr_present=verification_row.qr_present if verification_row else None,
         qr_valid=verification_row.qr_valid if verification_row else None,
+        qr_warning=verification_row.qr_warning if verification_row else None,
         comparison_consistency_pct=comparison_row.consistency_percentage if comparison_row else None,
         fraud_probability=fraud_row.fraud_probability if fraud_row else None,
         ocr_accuracy=ocr_row.ocr_accuracy if ocr_row else None,
-        # New signals
         doc_classification_confidence=doc_type_row.confidence_score if doc_type_row else None,
         field_extraction_completeness=_compute_field_completeness(ocr_row),
         evidence_breakdown=evidence_breakdown,
         critical_overrides=list(getattr(fraud_row, "_overrides", []) or []),
     )
 
+    context_rows = {
+        "doc_type_row": doc_type_row,
+        "ocr_row": ocr_row,
+        "verification_row": verification_row,
+        "fraud_row": fraud_row,
+        "trust_row": trust_row,
+        "comparison_row": comparison_row,
+    }
+    return inputs, context_rows
+
+
+@router.post("/{certificate_id}/predict", response_model=FinalPredictionResponse)
+@router.post("/{certificate_id}/prediction", response_model=FinalPredictionResponse, include_in_schema=False)
+async def run_prediction(
+    certificate_id: str,
+    user: User = Depends(get_current_verified_user),
+    db: AsyncSession = Depends(get_db),
+):
+    cert = await _get_owned_certificate(certificate_id, user, db)
+    inputs, rows = await _gather_prediction_inputs(cert, user, db, auto_run_prereqs=True)
     result = predict(inputs)
 
-    existing = await db.execute(select(FinalPrediction).where(FinalPrediction.certificate_id == cert.id))
-    prediction_row = existing.scalar_one_or_none()
+    existing = await db.execute(
+        select(FinalPrediction)
+        .where(FinalPrediction.certificate_id == cert.id)
+        .order_by(FinalPrediction.id.desc())
+    )
+    prediction_row = existing.scalars().first()
     if prediction_row is None:
         prediction_row = FinalPrediction(certificate_id=cert.id)
         db.add(prediction_row)
 
-    prediction_row.label              = PredictionLabel(result.label)
+    lbl_raw = str(result.label).lower()
+    if lbl_raw == "inconclusive":
+        pred_label = PredictionLabel.SUSPICIOUS
+    else:
+        pred_label = PredictionLabel(result.label)
+
+    prediction_row.label              = pred_label
     prediction_row.confidence_score   = result.confidence
     prediction_row.explanation        = result.explanation
     prediction_row.recommended_action = result.recommended_action
+
+    # Update verification_jobs stage_states if job exists
+    job_res = await db.execute(
+        select(VerificationJob)
+        .where(VerificationJob.certificate_id == cert.id)
+        .order_by(VerificationJob.id.desc())
+    )
+    job = job_res.scalars().first()
+    if job:
+        stage_states = dict(job.stage_states or {})
+        stage_summary = (
+            f"Verdict: {result.label.upper()}, "
+            f"Confidence: {round(result.confidence * 100)}%, "
+            f"Coverage: {round(result.coverage * 100)}%"
+        )
+        state_entry = {
+            "status": "COMPLETED",
+            "label": "Final Prediction & Verdict",
+            "completed_at": datetime.utcnow().isoformat(),
+            "details": stage_summary,
+        }
+        stage_states["prediction"] = state_entry
+        stage_states["final_prediction"] = state_entry
+        stage_states["FINAL_PREDICTION"] = state_entry
+        job.stage_states = stage_states
+        job.progress_percentage = 100
+        job.status = JobStatus.COMPLETED
+
+    # Log audit event
+    audit_entry = AuditLog(
+        organization_id=cert.organization_id,
+        actor_user_id=user.id,
+        action="verification:final_prediction_completed",
+        entity_type="certificate",
+        entity_id=cert.id,
+        metadata_json={
+            "label": result.label,
+            "confidence_score": result.confidence,
+            "coverage": result.coverage,
+            "recommended_action": result.recommended_action,
+        },
+    )
+    db.add(audit_entry)
 
     await db.commit()
     await db.refresh(prediction_row)
 
     response = FinalPredictionResponse.model_validate(prediction_row)
     response.fraud_probability      = result.fraud_probability
+    response.coverage               = result.coverage
+    response.decision_support_note   = (
+        "Note: This verdict is AI-generated decision support. A human compliance reviewer "
+        "makes the final call on Suspicious and Inconclusive results before taking adverse action."
+    )
     response.evidence               = result.evidence
     response.reasons                = result.reasons
     response.verification_summary   = _build_summary(
-        doc_type_row, ocr_row, comparison_row, verification_row, fraud_row, trust_row
+        rows["doc_type_row"], rows["ocr_row"], rows["comparison_row"],
+        rows["verification_row"], rows["fraud_row"], rows["trust_row"]
     )
     return response
 
 
 @router.get("/{certificate_id}/prediction", response_model=FinalPredictionResponse)
+@router.get("/{certificate_id}/predict", response_model=FinalPredictionResponse, include_in_schema=False)
 async def get_prediction(
     certificate_id: str,
     user: User = Depends(get_current_verified_user),
@@ -195,18 +296,21 @@ async def get_prediction(
     if not prediction_row:
         raise HTTPException(status_code=404, detail="No prediction has been made for this certificate yet.")
 
-    doc_type_row = await _fetch_one(db, DocumentType, DocumentType.certificate_id == cert.id)
-    ocr_row = await _fetch_one(db, OCRData, OCRData.certificate_id == cert.id)
-    verification_row = await _fetch_one(db, VerificationResult, VerificationResult.certificate_id == cert.id)
-    fraud_row = await _fetch_one(db, FraudAnalysis, FraudAnalysis.certificate_id == cert.id)
-    trust_row = await _fetch_one(db, TrustScore, TrustScore.certificate_id == cert.id)
-    comparison_row = None
-    if cert.group_id:
-        comparison_row = await _fetch_one(db, DocumentComparison, DocumentComparison.group_id == cert.group_id)
+    inputs, rows = await _gather_prediction_inputs(cert, user, db, auto_run_prereqs=False)
+    result = predict(inputs)
 
     response = FinalPredictionResponse.model_validate(prediction_row)
-    response.verification_summary = _build_summary(
-        doc_type_row, ocr_row, comparison_row, verification_row, fraud_row, trust_row
+    response.fraud_probability      = result.fraud_probability
+    response.coverage               = result.coverage
+    response.decision_support_note   = (
+        "Note: This verdict is AI-generated decision support. A human compliance reviewer "
+        "makes the final call on Suspicious and Inconclusive results before taking adverse action."
+    )
+    response.evidence               = result.evidence
+    response.reasons                = result.reasons
+    response.verification_summary   = _build_summary(
+        rows["doc_type_row"], rows["ocr_row"], rows["comparison_row"],
+        rows["verification_row"], rows["fraud_row"], rows["trust_row"]
     )
     return response
 
@@ -251,18 +355,10 @@ def _build_summary(doc_type_row, ocr_row, comparison_row, verification_row, frau
 
 
 async def _fetch_one(db: AsyncSession, model, condition):
-    result = await db.execute(select(model).where(condition))
-    return result.scalar_one_or_none()
+    result = await db.execute(select(model).where(condition).order_by(model.id.desc()))
+    return result.scalars().first()
 
 
 async def _get_owned_certificate(certificate_id: str, user: User, db: AsyncSession) -> Certificate:
-    result = await db.execute(
-        select(Certificate).where(Certificate.id == certificate_id)
-    )
-    cert = result.scalar_one_or_none()
-    if not cert:
-        raise HTTPException(status_code=404, detail="Certificate not found.")
-
-    from app.api.deps import verify_tenant_access
-    verify_tenant_access(user, cert.organization_id, cert.owner_id)
-    return cert
+    from app.api.deps import get_owned_certificate
+    return await get_owned_certificate(certificate_id, user, db)

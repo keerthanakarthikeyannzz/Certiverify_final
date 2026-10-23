@@ -367,8 +367,48 @@ docker compose logs backend | grep "DEV EMAIL" -A3
 Run tests:
 ```bash
 cd backend
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 pytest -v
+```
+
+## Development Environment Setup & One-Command Launch
+
+If your system Python or conda base environment has issues, isolate the backend in a dedicated `.venv`:
+
+### 1. Backend Virtual Environment Setup
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2. Frontend Setup
+```bash
+cd frontend
+npm install
+```
+
+### 3. One-Command Dev Launcher
+From the repository root:
+```bash
+make dev
+# or
+bash scripts/dev.sh
+```
+This launcher:
+- Validates the backend port (`PORT` / `BACKEND_PORT`, default: `8000`), printing the holding PID if occupied.
+- Automatically uses `backend/.venv/bin/python`.
+- Launches the FastAPI backend with non-blocking background OCR/blockchain initialization.
+- Waits for `GET /health` to respond with `200 OK` before starting Next.js.
+- Launches the Next.js frontend with live backend connection polling.
+- Gracefully terminates all background services on `Ctrl+C`.
+
+To change ports dynamically via environment variables without code modifications:
+```bash
+PORT=8001 make dev
 ```
 
 ---

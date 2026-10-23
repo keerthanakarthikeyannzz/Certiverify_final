@@ -15,8 +15,8 @@ import sys
 import uuid
 import httpx
 
-SERVER_ROOT = "http://127.0.0.1:8000"
-API_BASE = "http://127.0.0.1:8000/api/v1"
+SERVER_ROOT = os.getenv("BACKEND_URL", f"http://{os.getenv('BACKEND_HOST', os.getenv('HOST', '127.0.0.1'))}:{os.getenv('BACKEND_PORT', os.getenv('PORT', '8000'))}")
+API_BASE = f"{SERVER_ROOT}/api/v1"
 DB_PATH = "./certiverify_dev.db" if os.path.exists("./certiverify_dev.db") else "../backend/certiverify_dev.db"
 SAMPLE_PDF_CANDIDATES = [
     "./sample_certificate.pdf",

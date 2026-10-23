@@ -100,10 +100,5 @@ async def get_document_type(
 
 
 async def _get_owned_certificate(certificate_id: str, user: User, db: AsyncSession) -> Certificate:
-    result = await db.execute(
-        select(Certificate).where(Certificate.id == certificate_id, Certificate.owner_id == user.id)
-    )
-    cert = result.scalar_one_or_none()
-    if not cert:
-        raise HTTPException(status_code=404, detail="Certificate not found.")
-    return cert
+    from app.api.deps import get_owned_certificate
+    return await get_owned_certificate(certificate_id, user, db)

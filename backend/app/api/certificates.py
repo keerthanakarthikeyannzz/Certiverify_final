@@ -27,7 +27,10 @@ from app.schemas.certificate_schemas import (
 )
 from app.services.storage_service import get_storage_backend
 from app.utils.file_validation import validate_certificate_file
-from app.api.deps import get_current_verified_user, get_current_verified_user_flexible
+from app.api.deps import (
+    get_current_verified_user, get_current_verified_user_flexible,
+    get_owned_certificate, normalize_cert_id,
+)
 
 logger = logging.getLogger("certiverify.certificates")
 
@@ -242,18 +245,8 @@ async def delete_certificate_history_entry(
     - Commits transaction safely and rolls back on failure.
     - Records an audit log event for compliance tracking.
     """
-    # 1. Look up the certificate
-    res = await db.execute(select(Certificate).where(Certificate.id == certificate_id))
-    cert = res.scalar_one_or_none()
-    if not cert:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Verification history entry not found.",
-        )
-
-    # 2. Enforce tenancy & ownership permissions
-    from app.api.deps import verify_tenant_access
-    verify_tenant_access(user, cert.organization_id, cert.owner_id)
+    # 1. Look up the certificate & verify tenancy/ownership
+    cert = await get_owned_certificate(certificate_id, user, db)
 
     role_str = str(user.role.value if hasattr(user.role, "value") else user.role).lower()
     if "admin" not in role_str and str(cert.owner_id) != str(user.id):
@@ -451,9 +444,10 @@ async def link_certificates_into_group(
     db: AsyncSession = Depends(get_db),
 ):
     """Retroactively group separately-uploaded documents (e.g. resume added later) for Module 5 comparison."""
+    normalized_ids = [normalize_cert_id(cid) for cid in payload.certificate_ids]
     result = await db.execute(
         select(Certificate).where(
-            Certificate.id.in_(payload.certificate_ids), Certificate.owner_id == user.id
+            Certificate.id.in_(normalized_ids), Certificate.owner_id == user.id
         )
     )
     certs = result.scalars().all()
@@ -470,14 +464,5 @@ async def link_certificates_into_group(
 
 
 async def _get_owned_certificate(certificate_id: str, user: User, db: AsyncSession) -> Certificate:
-    result = await db.execute(
-        select(Certificate).where(Certificate.id == certificate_id)
-    )
-    cert = result.scalar_one_or_none()
-    if not cert:
-        raise HTTPException(status_code=404, detail="Certificate not found.")
-
-    from app.api.deps import verify_tenant_access
-    verify_tenant_access(user, cert.organization_id, cert.owner_id)
-    return cert
+    return await get_owned_certificate(certificate_id, user, db)
 

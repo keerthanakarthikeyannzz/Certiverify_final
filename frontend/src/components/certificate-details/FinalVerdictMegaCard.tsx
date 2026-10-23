@@ -10,6 +10,7 @@ import {
   ArrowRight,
   TrendingDown,
   TrendingUp,
+  Info,
 } from "lucide-react";
 import {
   FinalPredictionResponse,
@@ -158,6 +159,17 @@ export const FinalVerdictMegaCard: React.FC<FinalVerdictMegaCardProps> = ({
               </p>
             </div>
           )}
+
+          {/* AI Decision Support Notice */}
+          <div className="p-3.5 bg-blue-50/70 border border-blue-200/80 rounded-xl flex items-start gap-2.5 text-xs text-blue-900">
+            <Info size={16} className="text-blue-600 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              <span className="font-semibold text-blue-950">AI Decision Support Notice</span>
+              <p className="text-[11.5px] text-blue-800 leading-normal">
+                This verdict provides automated decision support. A human compliance reviewer makes the final determination on <strong>SUSPICIOUS</strong> and <strong>INCONCLUSIVE</strong> findings prior to adverse administrative actions.
+              </p>
+            </div>
+          </div>
 
           {/* Action Triggers */}
           <div className="flex flex-wrap items-center gap-3 pt-2">

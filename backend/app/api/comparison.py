@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_verified_user
+from app.api.deps import get_current_verified_user, get_owned_certificate
 from app.db.database import get_db
 from app.models.models import Certificate, DocumentComparison, DocumentType, OCRData, User
 from app.schemas.comparison_schemas import DocumentComparisonResponse
@@ -210,19 +210,8 @@ async def compare_pair(
     user: User = Depends(get_current_verified_user),
     db: AsyncSession = Depends(get_db),
 ):
-    cert_a_res = await db.execute(
-        select(Certificate).where(Certificate.id == payload.certificate_id_a, Certificate.owner_id == user.id)
-    )
-    cert_a = cert_a_res.scalar_one_or_none()
-    if not cert_a:
-        raise HTTPException(status_code=404, detail="Document A certificate not found.")
-
-    cert_b_res = await db.execute(
-        select(Certificate).where(Certificate.id == payload.certificate_id_b, Certificate.owner_id == user.id)
-    )
-    cert_b = cert_b_res.scalar_one_or_none()
-    if not cert_b:
-        raise HTTPException(status_code=404, detail="Document B certificate not found.")
+    cert_a = await get_owned_certificate(payload.certificate_id_a, user, db)
+    cert_b = await get_owned_certificate(payload.certificate_id_b, user, db)
 
     ocr_a = await _ensure_ocr_data(cert_a, db)
     ocr_b = await _ensure_ocr_data(cert_b, db)
@@ -302,12 +291,7 @@ async def upload_and_compare(
     user: User = Depends(get_current_verified_user),
     db: AsyncSession = Depends(get_db),
 ):
-    cert_a_res = await db.execute(
-        select(Certificate).where(Certificate.id == certificate_id_a, Certificate.owner_id == user.id)
-    )
-    cert_a = cert_a_res.scalar_one_or_none()
-    if not cert_a:
-        raise HTTPException(status_code=404, detail="Document A certificate not found.")
+    cert_a = await get_owned_certificate(certificate_id_a, user, db)
 
     from app.services.storage_service import get_storage_backend
     storage = get_storage_backend()

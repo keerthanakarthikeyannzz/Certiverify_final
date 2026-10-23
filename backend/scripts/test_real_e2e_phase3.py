@@ -24,8 +24,8 @@ import sys
 import httpx
 import sqlite3
 
-SERVER_ROOT = "http://localhost:8000"
-API_BASE = "http://localhost:8000/api/v1"
+SERVER_ROOT = os.getenv("BACKEND_URL", f"http://{os.getenv('BACKEND_HOST', os.getenv('HOST', '127.0.0.1'))}:{os.getenv('BACKEND_PORT', os.getenv('PORT', '8000'))}")
+API_BASE = f"{SERVER_ROOT}/api/v1"
 TEST_EMAIL = "phase3_tester@certiverify.ai"
 TEST_PASSWORD = "Password123!"
 SAMPLE_PDF = "../sample_certificate.pdf" if os.path.exists("../sample_certificate.pdf") else "./sample_certificate.pdf"

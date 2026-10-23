@@ -91,6 +91,8 @@ class UserRole(str, enum.Enum):
     UNIVERSITY = "university"
     EMPLOYER = "employer"
     STUDENT = "student"
+    VERIFIER = "verifier"
+
 
 
 class User(Base):

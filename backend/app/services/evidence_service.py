@@ -313,14 +313,18 @@ async def emit_blockchain_evidence(
 
     status = (verification_row.blockchain_status or "unavailable").lower()
 
-    if status == "verified":
+    if status in ("verified", "match", "match (local_ledger)"):
         result = "PASS"
         conf = 1.0
-        explanation = f"Document SHA-256 hash verified on-chain. Tx Hash: {verification_row.blockchain_tx_hash or 'N/A'}."
-    elif status == "not_found":
+        explanation = f"Document SHA-256 hash verified ({verification_row.blockchain_status}). Tx Hash: {verification_row.blockchain_tx_hash or 'N/A'}."
+    elif status in ("not_found", "not_registered"):
         result = "NOT_FOUND"
         conf = 0.50
-        explanation = "Document hash was not found registered on the blockchain ledger."
+        explanation = "Document hash was not found registered on the blockchain ledger (neutral)."
+    elif status == "not_applicable":
+        result = "NOT_APPLICABLE"
+        conf = 0.0
+        explanation = "Blockchain verification is not configured."
     elif status == "mismatch":
         result = "FAIL"
         conf = 0.95

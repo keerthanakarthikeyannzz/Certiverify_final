@@ -16,6 +16,7 @@ import {
   ChevronDown,
 } from "lucide-react";
 import { Logo } from "@/components/ui/Logo";
+import { ConnectionStatus } from "@/components/ui/ConnectionStatus";
 import { orgApi, OrganizationResponse, getAccessToken } from "@/lib/api";
 
 interface HeaderProps {
@@ -147,6 +148,9 @@ export const Header: React.FC<HeaderProps> = ({ onOpenMobileSidebar }) => {
             className="w-48 lg:w-64 pl-9 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 transition-colors"
           />
         </div>
+
+        {/* Live Backend Connection Status */}
+        <ConnectionStatus />
 
         {/* Organization Switcher */}
         {org && (

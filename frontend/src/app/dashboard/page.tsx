@@ -33,6 +33,7 @@ import {
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { formatErrorMessage } from "@/lib/errorHandler";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Skeleton } from "@/components/ui/Skeleton";
 
@@ -79,8 +80,7 @@ export default function EnterpriseDashboardPage() {
         console.warn("Failed to fetch audit logs:", auditRes.reason);
       }
     } catch (err: unknown) {
-      const apiErr = err as { response?: { data?: { detail?: string } }; message?: string };
-      setError(apiErr?.response?.data?.detail || apiErr?.message || "Failed to load dashboard statistics.");
+      setError(formatErrorMessage(err, "Failed to load dashboard statistics."));
     } finally {
       setLoading(false);
     }
@@ -88,17 +88,25 @@ export default function EnterpriseDashboardPage() {
 
   useEffect(() => {
     fetchDashboardData();
-  }, [fetchDashboardData]);
+
+    // Auto-recover when server comes back online without a manual page rebuild
+    const handleStatus = (e: Event) => {
+      const customEvent = e as CustomEvent<{ online: boolean }>;
+      if (customEvent.detail?.online && error) {
+        fetchDashboardData();
+      }
+    };
+    window.addEventListener("backend-status-change", handleStatus);
+    return () => window.removeEventListener("backend-status-change", handleStatus);
+  }, [fetchDashboardData, error]);
 
   const handleDownloadReport = async (certId: string) => {
     setDownloadingId(certId);
     try {
-      const url = reportApi.downloadUrl(certId);
-      const token = getAccessToken();
-      const directUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url;
-      window.open(directUrl, "_blank");
-    } catch (err) {
+      await reportApi.download(certId);
+    } catch (err: any) {
       console.error("Failed to download report:", err);
+      alert(`Report download failed: ${err?.message || "Please try again."}`);
     } finally {
       setDownloadingId(null);
     }

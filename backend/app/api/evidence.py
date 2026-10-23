@@ -31,7 +31,9 @@ async def _get_authorized_certificate(certificate_id: str, user: User, db: Async
     if not has_permission(user.role.value, Permission.CERTIFICATE_READ):
         raise HTTPException(status_code=403, detail="Insufficient permission to view certificate evidence.")
 
-    res = await db.execute(select(Certificate).where(Certificate.id == certificate_id))
+    from app.api.deps import normalize_cert_id
+    normalized = normalize_cert_id(certificate_id)
+    res = await db.execute(select(Certificate).where(Certificate.id == normalized))
     cert = res.scalar_one_or_none()
     if not cert:
         raise HTTPException(status_code=404, detail=f"Certificate '{certificate_id}' not found.")

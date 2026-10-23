@@ -20,17 +20,19 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Any, Optional
+from datetime import datetime
 
 from app.db.database import get_db
-from app.models.models import User, Certificate, OCRData, VerificationResult
+from app.models.models import User, Certificate, OCRData, VerificationResult, VerificationJob
 from app.schemas.verification_schemas import VerificationResultResponse
 from app.services.qr_verification import verify_qr
-from app.services.blockchain_service import verify_hash_onchain
+from app.services.blockchain_service import verify_hash_onchain, get_blockchain_provider
 from app.services.tampering_detection import analyze_tampering
 from app.services.duplicate_detection import detect_duplicates
 from app.services.storage_service import get_storage_backend
-from app.services.image_preprocessing import load_image_as_array, preprocess_pipeline
+from app.services.image_preprocessing import load_image_as_array, preprocess_pipeline, _pdf_pages_to_arrays
 from app.services.ocr_field_extractor import detect_qr_code
+from app.services.audit_service import log_audit_event
 from app.api.deps import get_current_verified_user, get_current_verified_user_flexible
 
 logger = logging.getLogger("certiverify.verification")
@@ -52,43 +54,56 @@ async def run_qr_check(
     ocr_row = ocr_result.scalar_one_or_none()
     expected_cert_number = ocr_row.certificate_number if ocr_row else None
 
-    # ── Primary: detect QR directly from file bytes (independent of OCR) ────
-    # Ensures QR detection works even when OCR hasn't run yet, or when OCR
-    # missed the QR due to low resolution / preprocessing issues.
     qr_raw_data: str | None = None
     qr_confidence: int = 0
     detection_source = "none"
 
-    try:
-        storage = get_storage_backend()
-        file_bytes = await storage.read(cert.storage_path)
-        image = await asyncio.to_thread(load_image_as_array, file_bytes, cert.file_type)
-        direct_text, direct_confidence = await asyncio.to_thread(detect_qr_code, image)
-        if direct_text:
-            qr_raw_data = direct_text
-            qr_confidence = direct_confidence
-            detection_source = "direct_file"
-            logger.info(
-                "QR detection (direct) | cert_id=%s | confidence=%d | len=%d",
-                certificate_id, direct_confidence, len(direct_text),
-            )
-    except Exception as exc:
-        logger.warning("Direct QR detection failed (non-fatal, trying OCR fallback): %s", exc)
-
-    # ── Fallback: use QR data stored by OCR pipeline ─────────────────────────
-    if not qr_raw_data and ocr_row and ocr_row.qr_code_data:
+    # 1. Reuse existing OCR QR data first — don't re-decode needlessly
+    if ocr_row and ocr_row.qr_code_data:
         qr_raw_data = ocr_row.qr_code_data
         detection_source = "ocr_stored"
-        if ocr_row.field_confidences:
-            qr_confidence = int(ocr_row.field_confidences.get("_qr_confidence", 70))
+        if ocr_row.field_confidences and isinstance(ocr_row.field_confidences, dict):
+            qr_confidence = int(ocr_row.field_confidences.get("_qr_confidence", 85))
         else:
-            qr_confidence = 70
+            qr_confidence = 85
         logger.info(
-            "QR detection (OCR fallback) | cert_id=%s | confidence=%d",
+            "QR detection reused from OCR data | cert_id=%s | confidence=%d",
             certificate_id, qr_confidence,
         )
+    else:
+        # 2. Multi-pass decoding across document pages (PDF or image)
+        try:
+            storage = get_storage_backend()
+            file_bytes = await storage.read(cert.storage_path)
 
-    # Build OCR fields dict for cross-validation
+            if cert.file_type.lower() == "pdf":
+                pages = await asyncio.to_thread(_pdf_pages_to_arrays, file_bytes)
+                for page in pages:
+                    text, conf = await asyncio.to_thread(detect_qr_code, page["image"])
+                    if text:
+                        qr_raw_data = text
+                        qr_confidence = conf
+                        detection_source = f"direct_pdf_page_{page['index'] + 1}"
+                        logger.info(
+                            "QR detected on PDF page %d | cert_id=%s | conf=%d | len=%d",
+                            page["index"] + 1, certificate_id, conf, len(text),
+                        )
+                        break
+            else:
+                image = await asyncio.to_thread(load_image_as_array, file_bytes, cert.file_type)
+                text, conf = await asyncio.to_thread(detect_qr_code, image)
+                if text:
+                    qr_raw_data = text
+                    qr_confidence = conf
+                    detection_source = "direct_image"
+                    logger.info(
+                        "QR detected on image | cert_id=%s | conf=%d | len=%d",
+                        certificate_id, conf, len(text),
+                    )
+        except Exception as exc:
+            logger.warning("Document QR detection pass failed (non-fatal): %s", exc)
+
+    # Build OCR fields dict for cross-validation and live matching
     ocr_fields: dict | None = None
     if ocr_row:
         ocr_fields = {
@@ -99,32 +114,65 @@ async def run_qr_check(
         }
 
     logger.info(
-        "QR check | cert_id=%s | source=%s | qr_present=%s | cert_number=%s",
-        certificate_id, detection_source, bool(qr_raw_data), expected_cert_number,
+        "QR verify run | cert_id=%s | source=%s | qr_present=%s",
+        certificate_id, detection_source, bool(qr_raw_data),
     )
 
-    result = verify_qr(
+    result = await verify_qr(
         qr_raw_data,
-        expected_cert_number,
+        expected_certificate_number=expected_cert_number,
         qr_confidence=qr_confidence,
         ocr_fields=ocr_fields,
+        detection_source=detection_source,
     )
 
-    # Store qr_type and detection_source in decoded metadata for transparency
-    decoded_with_meta = dict(result.decoded) if result.decoded else {}
-    decoded_with_meta["_qr_type"] = result.qr_type
-    decoded_with_meta["_detection_source"] = detection_source
-    decoded_with_meta["_status"] = result.status
-    if result.reason:
-        decoded_with_meta["_reason"] = result.reason
+    decoded_with_meta = dict(result.decoded) if result.decoded else None
+    if decoded_with_meta:
+        decoded_with_meta["_qr_type"] = result.qr_type
+        decoded_with_meta["_detection_source"] = detection_source
+        decoded_with_meta["_status"] = result.status
+        decoded_with_meta["_qr_confidence"] = qr_confidence
+        if result.reason:
+            decoded_with_meta["_reason"] = result.reason
 
     verification_row = await _get_or_create_verification_row(cert.id, db)
     verification_row.qr_present = result.present
-    verification_row.qr_decoded_data = decoded_with_meta if result.present else result.decoded
+    verification_row.qr_decoded_data = decoded_with_meta
     verification_row.qr_valid = result.valid
     verification_row.qr_warning = result.reason or result.warning
     verification_row.cross_validation_status = result.cross_validation_status
     verification_row.cross_validation_mismatches = result.cross_validation_mismatches or []
+
+    # Update any existing verification job's stage_states
+    job_res = await db.execute(
+        select(VerificationJob).where(VerificationJob.certificate_id == cert.id).order_by(VerificationJob.id.desc())
+    )
+    job = job_res.scalars().first()
+    if job:
+        states = dict(job.stage_states or {})
+        now_iso = datetime.utcnow().isoformat()
+        if not result.present:
+            states["qr_verification"] = {
+                "status": "NOT_APPLICABLE",
+                "label": "QR Code Verification",
+                "completed_at": now_iso,
+                "details": result.reason or "No QR code detected on document",
+            }
+        elif result.valid:
+            states["qr_verification"] = {
+                "status": "COMPLETED",
+                "label": "QR Code Verification",
+                "completed_at": now_iso,
+                "details": f"QR payload verified ({result.qr_type})",
+            }
+        else:
+            states["qr_verification"] = {
+                "status": "FAILED",
+                "label": "QR Code Verification",
+                "completed_at": now_iso,
+                "details": result.reason or "QR verification failed",
+            }
+        job.stage_states = states
 
     elapsed_ms = round((time.monotonic() - t0) * 1000)
     logger.info(
@@ -133,6 +181,23 @@ async def run_qr_check(
         result.cross_validation_status,
         len(result.cross_validation_mismatches), elapsed_ms,
     )
+
+    await log_audit_event(
+        db,
+        action="verification:qr_completed",
+        entity_type="certificate",
+        actor_user_id=user.id,
+        organization_id=cert.organization_id,
+        entity_id=cert.id,
+        metadata_json={
+            "qr_present": result.present,
+            "qr_valid": result.valid,
+            "qr_type": result.qr_type,
+            "status": result.status,
+            "elapsed_ms": elapsed_ms,
+        },
+    )
+
     await db.commit()
     await db.refresh(verification_row)
     return verification_row
@@ -147,37 +212,27 @@ async def run_blockchain_verification(
 ):
     cert = await _get_owned_certificate(certificate_id, user, db)
 
-    # ── Hash Consistency Check ────────────────────────────────────────────────
-    # Re-compute SHA-256 from the stored file bytes and compare against the
-    # hash we recorded at upload time. A mismatch means the file was modified
-    # after upload (tampering evidence). This is separate from blockchain lookup.
-    hash_match_status = "NOT_REGISTERED"
-    try:
-        storage = get_storage_backend()
-        file_bytes = await storage.read(cert.storage_path)
-        fresh_hash = hashlib.sha256(file_bytes).hexdigest()
-        if fresh_hash == cert.sha256_hash:
-            hash_match_status = "MATCH"
-            logger.info("Hash consistency: MATCH | cert_id=%s", certificate_id)
-        else:
-            hash_match_status = "MISMATCH"
-            logger.warning(
-                "Hash consistency: MISMATCH | cert_id=%s | stored=%s | fresh=%s",
-                certificate_id, cert.sha256_hash[:16], fresh_hash[:16],
-            )
-    except Exception as exc:
-        logger.warning("Hash consistency check failed (non-fatal): %s", exc)
-        hash_match_status = "NOT_REGISTERED"
+    # 1. Document hash from certificates.sha256_hash (don't recompute unless missing)
+    if not cert.sha256_hash:
+        try:
+            storage = get_storage_backend()
+            file_bytes = await storage.read(cert.storage_path)
+            cert.sha256_hash = hashlib.sha256(file_bytes).hexdigest()
+            logger.info("Computed missing certificate SHA-256 hash | cert_id=%s", cert.id)
+            await db.commit()
+        except Exception as exc:
+            logger.warning("Failed computing SHA-256 hash: %s", exc)
 
-    # ── Blockchain Lookup ─────────────────────────────────────────────────────
     logger.info(
-        "Blockchain lookup | cert_id=%s | hash=%s...",
+        "Blockchain verification | cert_id=%s | hash=%s...",
         certificate_id, cert.sha256_hash[:16] if cert.sha256_hash else "None",
     )
+
+    # 2. Query blockchain via swappable BlockchainProvider
     result = verify_hash_onchain(cert.sha256_hash)
     logger.info(
-        "Blockchain result | status=%s | match=%s",
-        result.status, result.match,
+        "Blockchain result | status=%s | match=%s | provider=%s",
+        result.status, result.match, result.provider_name,
     )
 
     verification_row = await _get_or_create_verification_row(cert.id, db)
@@ -186,7 +241,73 @@ async def run_blockchain_verification(
     verification_row.blockchain_match = result.match
     verification_row.blockchain_tx_hash = result.tx_hash
     verification_row.blockchain_status = result.status
-    verification_row.hash_match_status = hash_match_status
+    verification_row.hash_match_status = "MATCH" if cert.sha256_hash else "NOT_REGISTERED"
+
+    # 3. Update VerificationJob stage_states
+    job_res = await db.execute(
+        select(VerificationJob).where(VerificationJob.certificate_id == cert.id).order_by(VerificationJob.id.desc())
+    )
+    job = job_res.scalars().first()
+    if job:
+        states = dict(job.stage_states or {})
+        now_iso = datetime.utcnow().isoformat()
+        if result.status == "NOT_APPLICABLE":
+            states["blockchain_verification"] = {
+                "status": "NOT_APPLICABLE",
+                "label": "Blockchain Verification",
+                "completed_at": now_iso,
+                "details": "Blockchain not configured",
+            }
+        elif result.status in ("MATCH", "verified", "MATCH (local_ledger)"):
+            states["blockchain_verification"] = {
+                "status": "COMPLETED",
+                "label": "Blockchain Verification",
+                "completed_at": now_iso,
+                "details": f"Verified ({result.status})",
+            }
+        elif result.status == "NOT_REGISTERED":
+            states["blockchain_verification"] = {
+                "status": "COMPLETED",
+                "label": "Blockchain Verification",
+                "completed_at": now_iso,
+                "details": "Certificate hash not registered on blockchain (neutral)",
+            }
+        elif result.status == "UNREACHABLE":
+            states["blockchain_verification"] = {
+                "status": "FAILED",
+                "label": "Blockchain Verification",
+                "completed_at": now_iso,
+                "details": result.reason or "Blockchain RPC unreachable",
+            }
+        elif result.status == "MISMATCH":
+            states["blockchain_verification"] = {
+                "status": "FAILED",
+                "label": "Blockchain Verification",
+                "completed_at": now_iso,
+                "details": result.reason or "Blockchain on-chain hash mismatch",
+            }
+        else:
+            states["blockchain_verification"] = {
+                "status": "COMPLETED",
+                "label": "Blockchain Verification",
+                "completed_at": now_iso,
+                "details": result.reason or str(result.status),
+            }
+        job.stage_states = states
+
+    await log_audit_event(
+        db,
+        action="verification:blockchain_completed",
+        entity_type="certificate",
+        actor_user_id=user.id,
+        organization_id=cert.organization_id,
+        entity_id=cert.id,
+        metadata_json={
+            "blockchain_status": result.status,
+            "blockchain_match": result.match,
+            "provider": result.provider_name,
+        },
+    )
 
     await db.commit()
     await db.refresh(verification_row)
@@ -264,19 +385,37 @@ async def run_tampering_detection(
     verification_row.tampering_flags = result.flags
     verification_row.tampering_risk_level = result.risk_level
     verification_row.tampering_confidence = result.confidence
+    import dataclasses
+
+    findings_data = []
+    for f in (result.findings or []):
+        if dataclasses.is_dataclass(f):
+            findings_data.append(dataclasses.asdict(f))
+        elif hasattr(f, "to_dict"):
+            findings_data.append(f.to_dict())
+        elif isinstance(f, dict):
+            findings_data.append(f)
+        else:
+            findings_data.append(str(f))
+
     verification_row.tampering_detail = {
         "status":             result.status,
         "tampering_status":   result.status,
+        "composite_score":    result.score,
+        "risk_level":         result.risk_level,
+        "confidence":         result.confidence,
+        "checks":             result.tampering_detail.get("checks", {}),
+        "active_weights":     result.tampering_detail.get("active_weights", {}),
         "image_quality":      result.image_quality,
         "ela":                result.ela,
         "copy_paste":         result.copy_paste,
         "font_consistency":   result.font_consistency,
-        "text_analysis":      result.text_analysis,   # PART E — text layout / alignment
+        "text_analysis":      result.text_analysis,
         "signature":          result.signature,
         "seal":               result.seal,
         "metadata":           result.metadata_detail,
         "document_structure": result.document_structure,
-        "findings":           result.findings,
+        "findings":           findings_data,
     }
 
     # Persist ELA heatmap alongside the certificate for reviewer inspection
@@ -285,6 +424,55 @@ async def run_tampering_detection(
         heatmap_path = await storage.save_bytes(result.ela_heatmap_png, heatmap_name, subdir="ela_heatmaps")
         verification_row.ela_heatmap_path = heatmap_path
 
+    # Update verification job stage states if job exists
+    job_res = await db.execute(
+        select(VerificationJob).where(VerificationJob.certificate_id == cert.id).order_by(VerificationJob.id.desc())
+    )
+    job = job_res.scalars().first()
+    if job:
+        states = dict(job.stage_states or {})
+        now_iso = datetime.utcnow().isoformat()
+        if result.status == "not_applicable_for_pdf_text_layer":
+            stage_info = {
+                "status": "NOT_APPLICABLE",
+                "label": "Tampering & Forgery Detection",
+                "completed_at": now_iso,
+                "details": "Digital vector PDF text layer (image forensics not applicable)",
+            }
+        elif result.risk_level in ("HIGH", "VERY_HIGH_RISK") or (result.score and result.score >= 60.0):
+            stage_info = {
+                "status": "FAILED",
+                "label": "Tampering & Forgery Detection",
+                "completed_at": now_iso,
+                "details": f"Tampering risk detected (Score: {result.score:.1f}/100 - {result.risk_level})",
+            }
+        else:
+            stage_info = {
+                "status": "COMPLETED",
+                "label": "Tampering & Forgery Detection",
+                "completed_at": now_iso,
+                "details": f"Analysis complete (Score: {result.score:.1f}/100 - {result.risk_level})",
+            }
+        states["tamper_analysis"] = stage_info
+        states["tampering"] = stage_info
+        job.stage_states = states
+
+    await log_audit_event(
+        db,
+        action="verification:tampering_completed",
+        entity_type="certificate",
+        actor_user_id=user.id,
+        organization_id=cert.organization_id,
+        entity_id=cert.id,
+        metadata_json={
+            "tampering_score": result.score,
+            "tampering_risk_level": result.risk_level,
+            "tampering_confidence": result.confidence,
+            "status": result.status,
+            "flags_count": len(result.flags),
+        },
+    )
+
     await db.commit()
     await db.refresh(verification_row)
     return verification_row
@@ -292,6 +480,7 @@ async def run_tampering_detection(
 
 @router.post("/{certificate_id}/verify-duplicate", response_model=VerificationResultResponse)
 @router.post("/{certificate_id}/check/duplicate", response_model=VerificationResultResponse, include_in_schema=False)
+@router.post("/{certificate_id}/analyze/duplicate", response_model=VerificationResultResponse, include_in_schema=False)
 async def run_duplicate_detection(
     certificate_id: str,
     user: User = Depends(get_current_verified_user),
@@ -302,7 +491,7 @@ async def run_duplicate_detection(
     ocr_result = await db.execute(select(OCRData).where(OCRData.certificate_id == cert.id))
     ocr_row = ocr_result.scalar_one_or_none()
 
-    # Load file bytes for visual similarity (PART I) — best-effort, non-blocking
+    # Load file bytes for visual similarity — best-effort, non-blocking
     file_bytes_for_visual: bytes | None = None
     try:
         from app.services.storage_service import get_storage_backend
@@ -319,8 +508,53 @@ async def run_duplicate_detection(
     verification_row.duplicate_of_certificate_id = result.duplicate_of_certificate_id
     verification_row.duplicate_match_reason = (result.match_reason or "")[:255]
 
-    # ── Rich structured result (Priority 7) ──────────────────────────────────
+    # ── Rich structured result (Module 4) ───────────────────────────────────
     verification_row.duplicate_detail = result.to_detail_dict()
+
+    # Update verification job stage states if job exists
+    job_res = await db.execute(
+        select(VerificationJob).where(VerificationJob.certificate_id == cert.id).order_by(VerificationJob.id.desc())
+    )
+    job = job_res.scalars().first()
+    if job:
+        states = dict(job.stage_states or {})
+        now_iso = datetime.utcnow().isoformat()
+        if result.is_duplicate:
+            stage_status = "WARNING" if result.same_owner else "FAILED"
+            details = f"Duplicate detected ({result.owner_distinction} - {result.match_layer})"
+        else:
+            stage_status = "COMPLETED"
+            details = "No duplicate records found in registry"
+
+        stage_info = {
+            "status": stage_status,
+            "label": "Duplicate Detection",
+            "completed_at": now_iso,
+            "details": details,
+        }
+        states["duplicate"] = stage_info
+        states["duplicate_detection"] = stage_info
+        states["DUPLICATE_DETECTION"] = stage_info
+        job.stage_states = states
+
+    from app.services.audit_service import log_audit_event
+    await log_audit_event(
+        db,
+        action="verification:duplicate_completed",
+        entity_type="certificate",
+        actor_user_id=user.id,
+        organization_id=cert.organization_id,
+        entity_id=cert.id,
+        metadata_json={
+            "is_duplicate": result.is_duplicate,
+            "match_layer": result.match_layer,
+            "same_owner": result.same_owner,
+            "owner_distinction": result.owner_distinction,
+            "duplicate_type": result.duplicate_type,
+            "matched_certificate_id": result.duplicate_of_certificate_id,
+            "confidence": result.confidence,
+        },
+    )
 
     await db.commit()
     await db.refresh(verification_row)
@@ -379,7 +613,9 @@ async def get_verification(
     result = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == cert.id))
     verification_row = result.scalar_one_or_none()
     if not verification_row:
-        raise HTTPException(status_code=404, detail="No verification has been run on this certificate yet.")
+        verification_row = await _get_or_create_verification_row(cert.id, db)
+        await db.commit()
+        await db.refresh(verification_row)
     return verification_row
 
 
@@ -401,25 +637,19 @@ async def get_ela_heatmap(
 
 
 async def _get_or_create_verification_row(certificate_id: str, db: AsyncSession) -> VerificationResult:
-    result = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == certificate_id))
+    from app.api.deps import normalize_cert_id
+    norm_id = normalize_cert_id(certificate_id)
+    result = await db.execute(select(VerificationResult).where(VerificationResult.certificate_id == norm_id))
     row = result.scalar_one_or_none()
     if row is None:
-        row = VerificationResult(certificate_id=certificate_id)
+        row = VerificationResult(certificate_id=norm_id)
         db.add(row)
     return row
 
 
 async def _get_owned_certificate(certificate_id: str, user: User, db: AsyncSession) -> Certificate:
-    result = await db.execute(
-        select(Certificate).where(Certificate.id == certificate_id)
-    )
-    cert = result.scalar_one_or_none()
-    if not cert:
-        raise HTTPException(status_code=404, detail="Certificate not found.")
-
-    from app.api.deps import verify_tenant_access
-    verify_tenant_access(user, cert.organization_id, cert.owner_id)
-    return cert
+    from app.api.deps import get_owned_certificate
+    return await get_owned_certificate(certificate_id, user, db)
 
 
 
@@ -511,14 +741,20 @@ async def get_enhanced_verification(
     }
 
     # ── Blockchain sub-object ─────────────────────────────────────────────────
+    raw_bc_status = (vr.blockchain_status or "").strip().lower()
     bc_status_map = {
-        "verified":     "VERIFIED",
-        "not_found":    "NOT_REGISTERED",
-        "mismatch":     "HASH_MISMATCH",
-        "unavailable":  "UNAVAILABLE",
+        "verified":             "VERIFIED",
+        "match":                "VERIFIED",
+        "match (local_ledger)": "VERIFIED",
+        "not_found":            "NOT_REGISTERED",
+        "not_registered":       "NOT_REGISTERED",
+        "mismatch":             "HASH_MISMATCH",
+        "unavailable":          "UNAVAILABLE",
+        "unreachable":          "UNREACHABLE",
+        "not_applicable":       "NOT_APPLICABLE",
     }
     blockchain_sub = {
-        "status": bc_status_map.get(vr.blockchain_status or "", "NOT_CHECKED"),
+        "status": bc_status_map.get(raw_bc_status, vr.blockchain_status or "NOT_CHECKED"),
         "algorithm": "SHA-256",
         "submitted_hash": vr.blockchain_hash_submitted,
         "onchain_hash": vr.blockchain_hash_onchain,
@@ -581,7 +817,8 @@ def _derive_composite(vr: VerificationResult) -> tuple[int, str, str]:
         checks += 1
 
     # Negative critical signals (hard overrides)
-    if vr.blockchain_status == "mismatch":
+    norm_bc_status = (vr.blockchain_status or "").strip().lower()
+    if norm_bc_status in ("mismatch",):
         return checks, "HIGH_RISK", (
             "Blockchain hash MISMATCH — the uploaded certificate hash does not match the "
             "on-chain record. The document may have been altered after original registration."
@@ -608,7 +845,7 @@ def _derive_composite(vr: VerificationResult) -> tuple[int, str, str]:
 
     # Positive signals
     qr_verified = vr.qr_present and vr.qr_valid is True
-    blockchain_verified = vr.blockchain_status == "verified"
+    blockchain_verified = norm_bc_status in ("verified", "match", "match (local_ledger)")
 
     if qr_verified and blockchain_verified:
         return checks, "STRONGLY_VERIFIED", (

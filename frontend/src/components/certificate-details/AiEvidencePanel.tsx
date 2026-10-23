@@ -135,40 +135,139 @@ export const AiEvidencePanel: React.FC<AiEvidencePanelProps> = ({
 
       {/* Trust Score Factor Contributions & Fraud Weights */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-slate-100">
-        {/* Factor Trust Contributions */}
-        <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-slate-800 flex items-center gap-1.5">
-              <Activity size={14} className="text-indigo-600" /> Trust Factor Breakdown
-            </span>
-            <span className="text-[10px] text-slate-400">0–100 Scale</span>
+        {/* Factor Trust Contributions & Monotonic Component Breakdown */}
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3 col-span-1 md:col-span-2">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 pb-2.5">
+            <div className="flex items-center gap-2">
+              <Activity size={16} className="text-indigo-600" />
+              <span className="text-sm font-bold text-slate-900">Trust Score Breakdown & Evidence Coverage</span>
+            </div>
+            {trustScore && (
+              <div className="flex items-center gap-2">
+                <span
+                  className={`text-xs px-2.5 py-0.5 rounded-full font-bold uppercase tracking-wider ${
+                    (trustScore.band || "").toUpperCase() === "HIGH" || trustScore.score >= 80
+                      ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
+                      : (trustScore.band || "").toUpperCase() === "MEDIUM" || trustScore.score >= 50
+                      ? "bg-amber-100 text-amber-800 border border-amber-300"
+                      : "bg-red-100 text-red-800 border border-red-300"
+                  }`}
+                >
+                  {trustScore.band_label || `${trustScore.band || "SCORE"} BAND`}
+                </span>
+                <span className="text-xs font-mono font-extrabold text-slate-800 bg-white border border-slate-200 px-2.5 py-0.5 rounded-lg shadow-sm">
+                  {Math.round(trustScore.score)} / 100
+                </span>
+              </div>
+            )}
           </div>
-          {trustScore?.breakdown?.factor_trust_values &&
-          Object.keys(trustScore.breakdown.factor_trust_values).length > 0 ? (
-            <div className="space-y-2">
-              {Object.entries(trustScore.breakdown.factor_trust_values).map(([factor, val]) => (
-                <div key={factor} className="space-y-1">
-                  <div className="flex justify-between text-xs">
-                    <span className="text-slate-600 capitalize">{factor.replace(/_/g, " ")}</span>
-                    <span className="font-semibold text-slate-900">{Math.round(val)}</span>
-                  </div>
-                  <div className="h-1.5 bg-slate-200 rounded-full overflow-hidden">
-                    <div
-                      className={`h-full rounded-full ${
-                        val >= 80 ? "bg-emerald-500" : val >= 50 ? "bg-amber-500" : "bg-red-500"
-                      }`}
-                      style={{ width: `${val}%` }}
-                    />
-                  </div>
+
+          {trustScore ? (
+            <div className="space-y-3">
+              {/* Coverage Progress Bar */}
+              <div className="bg-white border border-slate-200 rounded-lg p-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                <div>
+                  <span className="font-semibold text-slate-700">Verification Evidence Coverage: </span>
+                  <span className="font-bold text-indigo-700">
+                    {trustScore.coverage_percentage ??
+                      (trustScore.coverage ? Math.round(trustScore.coverage * 100) : 100)}
+                    %
+                  </span>
+                  <span className="text-slate-500 ml-1">
+                    ({trustScore.checks_evaluated ?? (trustScore.components?.filter((c) => c.status !== "not evaluated").length || 8)} of{" "}
+                    {trustScore.checks_total ?? 8} verification checks evaluated)
+                  </span>
                 </div>
-              ))}
+                <div className="w-full sm:w-36 bg-slate-100 h-2 rounded-full overflow-hidden shrink-0 border border-slate-200">
+                  <div
+                    className="bg-indigo-600 h-full rounded-full transition-all"
+                    style={{
+                      width: `${
+                        trustScore.coverage_percentage ??
+                        (trustScore.coverage ? Math.round(trustScore.coverage * 100) : 100)
+                      }%`,
+                    }}
+                  />
+                </div>
+              </div>
+
+              {/* Itemized Component Breakdown List */}
+              {trustScore.components && trustScore.components.length > 0 ? (
+                <div className="space-y-2">
+                  {trustScore.components.map((comp) => {
+                    const isPass = comp.status === "PASS";
+                    const isWarn = comp.status === "WARN";
+                    const isFail = comp.status === "FAIL";
+                    const isNotEval = comp.status === "not evaluated";
+
+                    const badgeClass = isPass
+                      ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                      : isWarn
+                      ? "bg-amber-50 text-amber-700 border-amber-200"
+                      : isFail
+                      ? "bg-red-50 text-red-700 border-red-200"
+                      : "bg-slate-100 text-slate-500 border-slate-200";
+
+                    return (
+                      <div
+                        key={comp.component}
+                        className={`p-2.5 rounded-lg border text-xs flex flex-col gap-1 transition-all ${
+                          isNotEval ? "bg-slate-50/60 border-slate-200 opacity-75" : "bg-white border-slate-200 shadow-2xs"
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-1">
+                          <span className="font-semibold text-slate-800">{comp.label}</span>
+                          <div className="flex items-center gap-2">
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold border uppercase ${badgeClass}`}>
+                              {comp.status}
+                            </span>
+                            {!isNotEval && (
+                              <span className="font-mono text-slate-700">
+                                Value: <b>{comp.value !== null ? Math.round(comp.value) : "—"}</b>
+                              </span>
+                            )}
+                            <span className="text-[11px] text-slate-500">
+                              Weight: <b>{Math.round(comp.weight * 100)}%</b>
+                            </span>
+                            <span className="text-[11px] text-indigo-700 font-semibold">
+                              +{comp.contribution.toFixed(1)} pts
+                            </span>
+                          </div>
+                        </div>
+                        <p className="text-[11px] text-slate-500 italic">{comp.reason}</p>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : trustScore?.breakdown?.factor_trust_values &&
+                Object.keys(trustScore.breakdown.factor_trust_values).length > 0 ? (
+                <div className="space-y-2">
+                  {Object.entries(trustScore.breakdown.factor_trust_values).map(([factor, val]) => (
+                    <div key={factor} className="space-y-1">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-slate-600 capitalize">{factor.replace(/_/g, " ")}</span>
+                        <span className="font-semibold text-slate-900">{Math.round(val)}</span>
+                      </div>
+                      <div className="h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full rounded-full ${
+                            val >= 80 ? "bg-emerald-500" : val >= 50 ? "bg-amber-500" : "bg-red-500"
+                          }`}
+                          style={{ width: `${val}%` }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
           ) : (
             <p className="text-xs text-slate-400 italic">
-              Compute Trust Score above to generate itemized factor weights.
+              Compute Trust Score above to generate itemized factor weights and coverage analysis.
             </p>
           )}
         </div>
+
 
         {/* Bayesian Fraud Weights */}
         <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">

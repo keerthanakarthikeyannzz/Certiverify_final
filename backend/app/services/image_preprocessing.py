@@ -74,35 +74,33 @@ def _pdf_pages_to_arrays(pdf_bytes: bytes, dpi: int = 200) -> list[dict]:
         import fitz  # PyMuPDF
         logger.info("PDF rendering: using PyMuPDF")
         try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            pages: list[dict] = []
+            zoom = dpi / 72
+            matrix = fitz.Matrix(zoom, zoom)
+            with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+                page_count = doc.page_count
+                logger.info("✔ PDF loaded via PyMuPDF: %d page(s)", page_count)
+                for page_num in range(page_count):
+                    try:
+                        page = doc.load_page(page_num)
+                        pix = page.get_pixmap(matrix=matrix)
+                        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                        if pix.n == 4:
+                            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+                        else:
+                            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                        pages.append({"index": page_num, "image": img})
+                        logger.info("✔ PDF page %d rendered via PyMuPDF: shape=%s", page_num, img.shape)
+                    except Exception as exc:
+                        logger.warning("PDF page %d failed to render: %s", page_num, exc)
+            if pages:
+                return pages
+            raise RuntimeError("PyMuPDF rendered 0 usable pages from the PDF.")
+        except RuntimeError:
+            raise
         except Exception as exc:
             logger.error("PyMuPDF failed to open PDF stream: %s\n%s", exc, traceback.format_exc())
             raise RuntimeError(f"PyMuPDF could not open the PDF: {exc}") from exc
-
-        page_count = doc.page_count
-        logger.info("✔ PDF loaded via PyMuPDF: %d page(s)", page_count)
-        zoom = dpi / 72
-        matrix = fitz.Matrix(zoom, zoom)
-        pages: list[dict] = []
-
-        for page_num in range(page_count):
-            try:
-                page = doc.load_page(page_num)
-                pix = page.get_pixmap(matrix=matrix)
-                img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-                if pix.n == 4:
-                    img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-                else:
-                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                pages.append({"index": page_num, "image": img})
-                logger.info("✔ PDF page %d rendered via PyMuPDF: shape=%s", page_num, img.shape)
-            except Exception as exc:
-                logger.warning("PDF page %d failed to render: %s", page_num, exc)
-
-        doc.close()
-        if pages:
-            return pages
-        raise RuntimeError("PyMuPDF rendered 0 usable pages from the PDF.")
 
     except ImportError:
         logger.warning("PyMuPDF (fitz) not installed, trying pdf2image fallback")

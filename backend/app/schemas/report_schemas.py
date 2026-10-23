@@ -64,3 +64,28 @@ class DashboardStatsResponse(BaseModel):
     qr_verified_count: int = 0
     blockchain_verified_count: int = 0
     doc_type_distribution: dict = {}           # {"aadhaar": 3, "degree": 7, ...}
+
+
+class ReportListItem(BaseModel):
+    id: str
+    certificate_id: str
+    certificate_filename: str
+    file_type: str
+    sha256_hash: str
+    verification_id: str
+    generated_at: datetime
+    digital_signature: Optional[str] = None
+    pdf_path: Optional[str] = None
+    prediction_label: Optional[str] = None
+    trust_score: Optional[float] = None
+
+    class Config:
+        from_attributes = True
+
+
+class SignatureVerificationResponse(BaseModel):
+    is_valid: bool
+    verification_id: str
+    digital_signature: Optional[str] = None
+    checked_at: datetime
+    detail: str

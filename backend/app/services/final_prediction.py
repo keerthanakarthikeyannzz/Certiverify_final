@@ -1,45 +1,47 @@
 """
-MODULE 9 — FINAL PREDICTION (Enhanced)
+MODULE 7 — FINAL PREDICTION ENGINE (prediction)
 
-Classifies a certificate as Genuine / Suspicious / Fake from its Trust
-Score (Module 8) and produces a structured evidence JSON breakdown with
-a reasons list.
+Synthesizes the Trust Score, Fraud Probability, Evidence Coverage, and
+Critical Hard-Override Flags into an institutional integrity verdict:
+    - GENUINE
+    - SUSPICIOUS
+    - FAKE (LIKELY_FORGED)
+    - INCONCLUSIVE
 
-ENHANCEMENTS over original:
-  - Returns structured `evidence` dict (per-factor status, score, label)
-  - Returns `reasons` list (human-readable bullet sentences)
-  - Returns `fraud_probability` directly in result for single-call access
-  - Existing `explanation` string preserved (backward compatible)
-  - Critical evidence labels surface in reasons list
-  - Thresholds unchanged: ≥80 Genuine, 50–79 Suspicious, <50 Fake
-
-The evidence dict matches the spec's JSON structure:
-  {
-    "ocr":            {"score": 94, "status": "PASS"},
-    "classification": {"score": 96, "status": "PASS"},
-    "field_extraction":{"score": 91, "status": "PASS"},
-    "comparison":     {"score": 93, "status": "PASS"},
-    "qr":             {"status": "VERIFIED"},
-    "blockchain":     {"status": "MATCH"},
-    "tampering":      {"score": 5,  "status": "LOW_RISK"},
-    "duplicate":      {"status": "NOT_FOUND"},
-    "metadata":       {"status": "CLEAN"}
-  }
+Key Principles:
+1. Low-Coverage Protection: If evidence coverage is below a configurable minimum
+   (default: 50% / 4 of 8 checks), the verdict is returned as INCONCLUSIVE
+   rather than forcing a conclusive genuine/fake verdict.
+2. Hard-Override Enforcement: Incontrovertible evidence of fraud (blockchain mismatch,
+   unauthorized duplicate collision, or severe tampering >= 70) forces FAKE.
+3. Threshold-Based Classification: Uses settings-configured trust and fraud thresholds.
+4. Evidence-Grounded Explanation: Builds a plain-language explanation detailing
+   which checks passed, which failed, and which were not evaluated.
+5. Action Mapping: Maps each verdict label to a configurable operational recommendation.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from app.core.config import settings
 
 
 @dataclass
 class PredictionInputs:
     trust_score: float                                  # 0-100
-    data_completeness: float = 0.0                      # 0-1, fraction of factors with real data
+    data_completeness: float = 0.0                      # 0-1, legacy completeness
+    coverage: float | None = None                       # 0.0 - 1.0 (e.g. 0.75)
+    checks_evaluated: int | None = None                 # e.g. 6
+    checks_total: int | None = 8                        # 8
     is_duplicate: bool | None = None
     tampering_score: float | None = None                # 0-100
     tampering_status: str | None = None                 # analyzed | not_applicable_for_pdf_text_layer | failed: <reason> | unavailable
+    tampering_risk_level: str | None = None
     blockchain_status: str | None = None
+    blockchain_match: bool | None = None
     qr_present: bool | None = None
     qr_valid: bool | None = None
+    qr_warning: str | None = None
     comparison_consistency_pct: float | None = None
     fraud_probability: float | None = None              # 0-1
     ocr_accuracy: float | None = None                  # 0-1
@@ -47,157 +49,162 @@ class PredictionInputs:
     duplicate_same_owner: bool | None = None
     duplicate_type: str | None = None
     duplicate_match_reason: str | None = None
-    # New structured evidence from trust score engine
+    duplicate_detail: dict[str, Any] | None = None
+    # Structured evidence and components from Trust Score engine
     evidence_breakdown: dict | None = None              # from TrustScoreResult.evidence_breakdown
-    # New signals
+    components: list[dict[str, Any]] | None = None      # itemized components list
     doc_classification_confidence: float | None = None  # 0-1
     field_extraction_completeness: float | None = None  # 0-1
+    image_quality_score: float | None = None
     critical_overrides: list[str] | None = None         # from FraudAnalysisResult
 
 
 @dataclass
 class PredictionResult:
-    label: str                                         # "genuine" | "suspicious" | "fake"
+    label: str                                         # "genuine" | "suspicious" | "fake" | "inconclusive"
     confidence: float                                  # 0-1
-    explanation: str                                   # plain text (backward compatible)
+    explanation: str                                   # plain language detailed explanation
     recommended_action: str
-    fraud_probability: float = 0.0                    # 0-1, mirrored for convenience
+    fraud_probability: float = 0.0                    # 0-1
+    trust_score: float = 0.0                          # 0-100
+    coverage: float = 1.0                             # 0.0 - 1.0
     evidence: dict = field(default_factory=dict)       # structured per-factor JSON
     reasons: list[str] = field(default_factory=list)   # human-readable bullet sentences
-
-
-GENUINE_THRESHOLD    = 80
-SUSPICIOUS_THRESHOLD = 50
+    passed_checks: list[str] = field(default_factory=list)
+    failed_checks: list[str] = field(default_factory=list)
+    not_evaluated_checks: list[str] = field(default_factory=list)
 
 
 def predict(inputs: PredictionInputs) -> PredictionResult:
-    score = inputs.trust_score
-    fp    = inputs.fraud_probability or 0.0
+    """
+    Synthesize Trust Score, Fraud Probability, Coverage, and Hard Overrides into a final verdict.
+    """
+    score = float(inputs.trust_score)
+    fp = float(inputs.fraud_probability if inputs.fraud_probability is not None else 0.0)
 
-    # ── Primary classification from trust score ───────────────────────────
-    if score >= GENUINE_THRESHOLD:
-        label = "genuine"
-    elif score >= SUSPICIOUS_THRESHOLD:
-        label = "suspicious"
+    # ── 1. Calculate Coverage ──
+    checks_total = inputs.checks_total or 8
+    if isinstance(inputs.coverage, dict):
+        cov = float(inputs.coverage.get("ratio", 0.0))
+        completed_checks = inputs.checks_evaluated or int(inputs.coverage.get("evaluated", round(cov * checks_total)))
+        checks_total = int(inputs.coverage.get("total", checks_total))
+    elif inputs.coverage is not None:
+        cov = float(inputs.coverage)
+        completed_checks = inputs.checks_evaluated or int(round(cov * checks_total))
+    elif inputs.data_completeness > 0:
+        cov = float(inputs.data_completeness)
+        completed_checks = int(round(cov * checks_total))
     else:
-        label = "fake"
+        # Count available signals
+        active_count = 0
+        if inputs.ocr_accuracy is not None: active_count += 1
+        if inputs.tampering_score is not None: active_count += 1
+        if inputs.is_duplicate is not None: active_count += 1
+        if inputs.qr_present is not None and inputs.qr_present: active_count += 1
+        if inputs.blockchain_status not in (None, "unavailable", ""): active_count += 1
+        if inputs.comparison_consistency_pct is not None: active_count += 1
+        if inputs.fraud_probability is not None: active_count += 1
+        if inputs.image_quality_score is not None: active_count += 1
+        completed_checks = active_count
+        cov = completed_checks / checks_total
 
-    # ── Critical checks requirement for Genuine verdict ──────────────────
-    # Exact rule: A verdict can be "genuine" only if all critical checks ran;
-    # otherwise it must read "inconclusive / needs review".
-    # Critical checks:
-    # 1. OCR Extraction (ocr_accuracy must be present)
-    # 2. Duplicate Detection (is_duplicate must be present)
-    # 3. Tampering Analysis (must be analyzed or not_applicable_for_pdf_text_layer; NOT None, NOT unavailable, NOT failed)
-    # 4. QR Verification (if QR code is detected on document, qr_valid must have run)
-    missing_critical: list[str] = []
-    is_pure_mock = (
-        inputs.ocr_accuracy is None
-        and inputs.is_duplicate is None
-        and inputs.tampering_score is None
-        and inputs.tampering_status is None
-        and inputs.data_completeness == 1.0
-    )
+    cov_percentage = round(cov * 100.0, 1)
+    min_coverage = getattr(settings, "PREDICTION_MIN_COVERAGE_FOR_VERDICT", 0.50)
 
-    if not is_pure_mock:
-        if inputs.ocr_accuracy is None:
-            missing_critical.append("OCR extraction")
-        if inputs.is_duplicate is None:
-            missing_critical.append("duplicate check")
-
-        tamp_st = (inputs.tampering_status or "").lower()
-        if tamp_st in ("unavailable", "not_checked") or tamp_st.startswith("failed"):
-            missing_critical.append("tampering analysis")
-        elif inputs.tampering_score is None and tamp_st != "not_applicable_for_pdf_text_layer":
-            missing_critical.append("tampering analysis")
-
-        if inputs.qr_present is True and inputs.qr_valid is None:
-            missing_critical.append("QR verification")
-
-    has_partial_critical = len(missing_critical) > 0
-
-    # ── Calculate N of M checks for partial verification note ─────────────
-    if inputs.evidence_breakdown and "_partial_verification" in inputs.evidence_breakdown:
-        pv = inputs.evidence_breakdown["_partial_verification"]
-        completed_checks = pv.get("completed", 0)
-        total_checks = pv.get("total", 0)
-        partial_note = pv.get("note", f"Partial verification: {completed_checks} of {total_checks} checks completed")
-    else:
-        applicable_checks = ["OCR", "Classification", "Field Extraction", "Tampering", "Duplicate"]
-        if inputs.qr_present is not None:
-            applicable_checks.append("QR")
-        if inputs.blockchain_status is not None and inputs.blockchain_status != "unavailable":
-            applicable_checks.append("Blockchain")
-        if inputs.comparison_consistency_pct is not None:
-            applicable_checks.append("Comparison")
-
-        total_checks = len(applicable_checks)
-        completed_checks = total_checks - len(missing_critical)
-        if inputs.doc_classification_confidence is None:
-            completed_checks -= 1
-        if inputs.field_extraction_completeness is None:
-            completed_checks -= 1
-        completed_checks = max(0, completed_checks)
-        partial_note = f"Partial verification: {completed_checks} of {total_checks} checks completed"
-
-    if label == "genuine" and has_partial_critical:
-        label = "inconclusive"
-
-    # Rule 6: For text-only PDFs (status not_applicable_for_pdf_text_layer):
-    # require a verified QR on a trusted domain or a blockchain match to allow "genuine";
-    # otherwise return "inconclusive".
-    tamp_st = (inputs.tampering_status or "").lower()
-    is_text_only_pdf = tamp_st == "not_applicable_for_pdf_text_layer"
-    has_trusted_external_anchor = (inputs.qr_present is True and inputs.qr_valid is True) or (
-        inputs.blockchain_status == "verified"
-    )
-    if label == "genuine" and is_text_only_pdf and not has_trusted_external_anchor:
-        label = "inconclusive"
-        missing_critical.append("external anchor (verified QR code or blockchain match required for digital text-only PDF)")
-
-    dist_label = label if label in ("genuine", "suspicious", "fake") else "suspicious"
-    boundary_distance = _boundary_distance(score, dist_label)
-    confidence = round(
-        min(max(0.5 * boundary_distance + 0.5 * inputs.data_completeness, 0.0), 1.0), 4
-    )
-
-    # ── Duplicate hard override ───────────────────────────────────────────
+    # ── 2. Identify Hard Overrides & Critical Fraud Indicators ──
+    hard_ceilings = list(inputs.critical_overrides or [])
     dup_status = (inputs.duplicate_status or "").lower()
-    same_owner = bool(inputs.duplicate_same_owner)
-    is_own = dup_status == "own_reupload" or (
-        same_owner and not ("altered" in dup_status or dup_status.startswith("suspicious"))
-        and (inputs.duplicate_type == "EXACT_FILE_DUPLICATE" or not inputs.duplicate_type)
+    same_owner = bool(
+        inputs.duplicate_same_owner
+        or (inputs.duplicate_detail and inputs.duplicate_detail.get("same_owner"))
+        or (inputs.duplicate_detail and inputs.duplicate_detail.get("owner_distinction") == "SAME_OWNER_REUPLOAD")
+        or dup_status == "own_reupload"
     )
     is_altered = (
         "altered" in dup_status
-        or dup_status in ("suspicious: altered re-upload", "suspicious_altered_reupload")
         or (inputs.duplicate_type or "").upper() == "ALTERED_REUPLOAD"
+        or (inputs.duplicate_detail and (inputs.duplicate_detail.get("duplicate_type") or "").upper() == "ALTERED_REUPLOAD")
     )
 
-    if inputs.is_duplicate and not is_own and not is_altered:
-        label = "fake"
-        confidence = max(confidence, 0.90)
-    elif inputs.is_duplicate and is_altered:
-        if label in ("genuine", "inconclusive", "inconclusive / needs review"):
-            label = "suspicious"
+    is_confirmed_dup_collision = bool(inputs.is_duplicate and not same_owner and not is_altered)
+    is_blockchain_mismatch = bool(inputs.blockchain_status == "mismatch" or inputs.blockchain_match is False)
+    is_severe_tampering = bool(inputs.tampering_score is not None and inputs.tampering_score >= 70.0)
+    is_invalid_qr = bool(inputs.qr_present is True and inputs.qr_valid is False)
 
-    # ── Build structured evidence breakdown ───────────────────────────────
+    # ── 3. Decision Logic ──
+    genuine_trust_min = getattr(settings, "PREDICTION_GENUINE_TRUST_MIN", 80.0)
+    genuine_fraud_max = getattr(settings, "PREDICTION_GENUINE_FRAUD_MAX", 0.25)
+    suspicious_trust_min = getattr(settings, "PREDICTION_SUSPICIOUS_TRUST_MIN", 50.0)
+    suspicious_fraud_max = getattr(settings, "PREDICTION_SUSPICIOUS_FRAUD_MAX", 0.60)
+
+    t_stat = (inputs.tampering_status or "").lower()
+    is_tampering_unrun = (inputs.tampering_score is None) and (t_stat in ("unavailable", "unrun"))
+    is_text_pdf_no_anchor = t_stat == "not_applicable_for_pdf_text_layer" and not (
+        inputs.qr_valid is True or inputs.blockchain_status == "verified" or inputs.blockchain_match is True
+    )
+
+    # Conclusive fraud flags always force FAKE regardless of coverage
+    if is_confirmed_dup_collision or is_blockchain_mismatch or is_severe_tampering:
+        label = "fake"
+        confidence = 0.95
+    elif is_invalid_qr or is_altered:
+        label = "suspicious"
+        confidence = 0.85
+    elif cov < min_coverage or is_tampering_unrun or is_text_pdf_no_anchor:
+        # LOW COVERAGE GATE / CRITICAL CHECK MISSING: Insufficient evidence to render a definitive verdict
+        label = "inconclusive"
+        confidence = round(max(0.30, min(cov, 0.70)), 2)
+    elif score >= genuine_trust_min and fp <= genuine_fraud_max:
+        label = "genuine"
+        # Confidence scales with trust score and coverage
+        confidence = round(min(0.5 * (score / 100.0) + 0.3 * (1.0 - fp) + 0.2 * cov, 1.0), 2)
+    elif score >= suspicious_trust_min and fp <= suspicious_fraud_max:
+        label = "suspicious"
+        confidence = round(min(0.70 + 0.25 * cov, 0.95), 2)
+    else:
+        label = "fake"
+        confidence = round(min(0.5 * (1.0 - score / 100.0) + 0.5 * fp, 1.0), 2)
+
+    # ── 4. Itemized Check Categorization (Passed / Failed / Not Evaluated) ──
+    passed_checks, failed_checks, not_eval_checks = _categorize_checks(inputs)
+
+    # ── 5. Build Structured Reasons List ──
+    reasons = _build_reasons(inputs, label, score, fp)
+
+    # ── 6. Build Plain Language Explanation ──
+    explanation_parts = [
+        f"Automated Verdict: {label.upper()} (Confidence: {round(confidence * 100)}%).",
+        f"The certificate achieved an overall Trust Score of {score:.1f}/100 with an estimated AI fraud probability of {fp * 100:.1f}%.",
+        f"Partial verification: {completed_checks} of {checks_total} verification checks evaluated ({cov_percentage}% coverage).",
+    ]
+
+    if passed_checks:
+        explanation_parts.append(f"Verified Positive Evidence: {'; '.join(passed_checks)}.")
+    if failed_checks:
+        explanation_parts.append(f"Identified Risk Signals & Failures: {'; '.join(failed_checks)}.")
+    if not_eval_checks:
+        explanation_parts.append(f"Checks Excluded / Not Evaluated: {'; '.join(not_eval_checks)}.")
+
+    if label in ("suspicious", "inconclusive"):
+        explanation_parts.append(
+            "Decision Support Advisory: This verdict is AI-generated decision support. A human compliance officer must review the findings before taking adverse action."
+        )
+
+    explanation = " ".join(explanation_parts)
+
+    # ── 7. Map Recommended Operational Action ──
+    recommended_action = _build_recommended_action(label)
+
+    # ── 8. Build Evidence Breakdown ──
     evidence = _build_evidence(inputs)
     evidence["_partial_verification"] = {
         "completed": completed_checks,
-        "total": total_checks,
-        "note": partial_note,
-        "is_partial": completed_checks < total_checks,
+        "total": checks_total,
+        "coverage": cov,
+        "coverage_percentage": cov_percentage,
+        "is_partial": completed_checks < checks_total,
+        "note": f"{completed_checks} of {checks_total} checks evaluated ({cov_percentage}% coverage)",
     }
-
-    # ── Build reasons list ────────────────────────────────────────────────
-    reasons = _build_reasons(inputs, label, score, fp, missing_critical, completed_checks, total_checks, partial_note)
-
-    # ── Build plain text explanation (backward compatible) ────────────────
-    explanation = _build_explanation(inputs, label, score, missing_critical, partial_note)
-
-    # ── Recommended action ────────────────────────────────────────────────
-    recommended_action = _build_recommended_action(label, inputs)
 
     return PredictionResult(
         label=label,
@@ -205,21 +212,207 @@ def predict(inputs: PredictionInputs) -> PredictionResult:
         explanation=explanation,
         recommended_action=recommended_action,
         fraud_probability=fp,
+        trust_score=score,
+        coverage=cov,
         evidence=evidence,
         reasons=reasons,
+        passed_checks=passed_checks,
+        failed_checks=failed_checks,
+        not_evaluated_checks=not_eval_checks,
     )
 
 
-# ---------------------------------------------------------------------------
-# Evidence breakdown builder
-# ---------------------------------------------------------------------------
+def _categorize_checks(inputs: PredictionInputs) -> tuple[list[str], list[str], list[str]]:
+    passed_checks: list[str] = []
+    failed_checks: list[str] = []
+    not_eval_checks: list[str] = []
+
+    # QR
+    if inputs.qr_present is None or inputs.qr_present is False:
+        not_eval_checks.append("QR Verification (no QR code on document)")
+    elif inputs.qr_valid is True:
+        passed_checks.append("QR Code cryptographic signature verified")
+    elif inputs.qr_valid is False:
+        failed_checks.append(f"QR Code validation failed ({inputs.qr_warning or 'invalid payload'})")
+    else:
+        failed_checks.append("QR Code warning (untrusted host/domain)")
+
+    # Blockchain
+    bc_st = (inputs.blockchain_status or "").lower()
+    if bc_st in ("", "unavailable", "not_applicable", "skipped", "none"):
+        not_eval_checks.append("Blockchain Verification (not configured/unavailable)")
+    elif bc_st == "verified" or inputs.blockchain_match is True:
+        passed_checks.append("Blockchain ledger cryptographic proof anchored")
+    elif bc_st == "mismatch" or inputs.blockchain_match is False:
+        failed_checks.append("Blockchain cryptographic hash MISMATCH against immutable record")
+    elif bc_st == "not_found":
+        not_eval_checks.append("Blockchain registry (document unanchored/not registered)")
+
+    # OCR
+    if inputs.ocr_accuracy is not None:
+        pct = round(inputs.ocr_accuracy * 100, 1)
+        if pct >= 80.0:
+            passed_checks.append(f"OCR text extraction accuracy high ({pct}%)")
+        elif pct >= 60.0:
+            failed_checks.append(f"OCR text extraction accuracy moderate ({pct}%)")
+        else:
+            failed_checks.append(f"OCR text extraction accuracy low ({pct}%)")
+    else:
+        not_eval_checks.append("OCR extraction")
+
+    # Tampering
+    t_stat = (inputs.tampering_status or "").lower()
+    if inputs.tampering_score is not None:
+        ts_val = round(inputs.tampering_score, 1)
+        if ts_val < 25.0:
+            passed_checks.append(f"Tampering & ELA scan clean (tampering score {ts_val}/100 [LOW])")
+        elif ts_val < 60.0:
+            failed_checks.append(f"Tampering scan detected moderate anomalies ({ts_val}/100)")
+        else:
+            failed_checks.append(f"Severe tampering detected: ELA/font forgery score ({ts_val}/100 [HIGH RISK])")
+    elif t_stat == "not_applicable_for_pdf_text_layer":
+        not_eval_checks.append("Tampering scan (digital vector PDF text layer)")
+    else:
+        not_eval_checks.append("Tampering analysis")
+
+    # Duplicate
+    dup_status = (inputs.duplicate_status or "").lower()
+    same_owner = bool(
+        inputs.duplicate_same_owner
+        or (inputs.duplicate_detail and inputs.duplicate_detail.get("same_owner"))
+        or (inputs.duplicate_detail and inputs.duplicate_detail.get("owner_distinction") == "SAME_OWNER_REUPLOAD")
+        or dup_status == "own_reupload"
+    )
+    is_altered = (
+        "altered" in dup_status
+        or (inputs.duplicate_type or "").upper() == "ALTERED_REUPLOAD"
+        or (inputs.duplicate_detail and (inputs.duplicate_detail.get("duplicate_type") or "").upper() == "ALTERED_REUPLOAD")
+    )
+
+    if inputs.is_duplicate is not None:
+        if not inputs.is_duplicate:
+            passed_checks.append("Credential uniqueness confirmed (no duplicates in registry)")
+        elif same_owner and not is_altered:
+            passed_checks.append("Benign re-upload by original verified owner")
+        elif is_altered:
+            failed_checks.append("Suspicious altered re-upload (same register number, conflicting file content)")
+        else:
+            failed_checks.append("Duplicate credential collision with a different user account")
+    else:
+        not_eval_checks.append("Duplicate detection")
+
+    # Fraud Analysis
+    if inputs.fraud_probability is not None:
+        fp_pct = round(inputs.fraud_probability * 100, 1)
+        if fp_pct <= 25.0:
+            passed_checks.append(f"AI Fraud probability low ({fp_pct}%)")
+        elif fp_pct <= 50.0:
+            failed_checks.append(f"AI Fraud probability moderate ({fp_pct}%)")
+        else:
+            failed_checks.append(f"AI Fraud probability high ({fp_pct}%)")
+    else:
+        not_eval_checks.append("AI Fraud Analysis")
+
+    # Comparison
+    if inputs.comparison_consistency_pct is not None:
+        comp_pct = round(inputs.comparison_consistency_pct, 1)
+        if comp_pct >= 80.0:
+            passed_checks.append(f"Cross-document consistency high ({comp_pct}%)")
+        else:
+            failed_checks.append(f"Cross-document consistency low ({comp_pct}%)")
+    else:
+        not_eval_checks.append("Cross-document comparison (single upload)")
+
+    # Image Quality
+    if inputs.image_quality_score is not None:
+        iq_val = round(inputs.image_quality_score, 1)
+        if iq_val >= 70.0:
+            passed_checks.append(f"Scan fidelity & resolution high ({iq_val}/100)")
+        else:
+            failed_checks.append(f"Scan quality degraded or low contrast ({iq_val}/100)")
+    else:
+        not_eval_checks.append("Scan image quality")
+
+    return passed_checks, failed_checks, not_eval_checks
+
+
+def _build_reasons(
+    inputs: PredictionInputs,
+    label: str,
+    trust_score: float = 0.0,
+    fraud_probability: float = 0.0,
+) -> list[str]:
+    passed_checks, failed_checks, not_eval_checks = _categorize_checks(inputs)
+    reasons: list[str] = []
+
+    checks_total = inputs.checks_total or 8
+    if isinstance(inputs.coverage, dict):
+        cov = float(inputs.coverage.get("ratio", 0.0))
+        completed_checks = inputs.checks_evaluated or int(inputs.coverage.get("evaluated", round(cov * checks_total)))
+        checks_total = int(inputs.coverage.get("total", checks_total))
+    elif inputs.coverage is not None:
+        cov = float(inputs.coverage)
+        completed_checks = inputs.checks_evaluated or int(round(cov * checks_total))
+    elif inputs.data_completeness > 0:
+        cov = float(inputs.data_completeness)
+        completed_checks = int(round(cov * checks_total))
+    else:
+        completed_checks = len(passed_checks) + len(failed_checks)
+        cov = completed_checks / checks_total
+
+    cov_percentage = round(cov * 100.0, 1)
+    min_coverage = getattr(settings, "PREDICTION_MIN_COVERAGE_FOR_VERDICT", 0.50)
+
+    if label.lower() == "inconclusive":
+        reasons.append(
+            f"ℹ Inconclusive verdict: Evidence coverage is {cov_percentage}% ({completed_checks} of {checks_total} checks evaluated), "
+            f"which is below the required {round(min_coverage * 100)}% threshold for an automated conclusive verdict."
+        )
+
+    if completed_checks < checks_total:
+        reasons.append(
+            f"Partial verification: {completed_checks} of {checks_total} checks completed ({cov_percentage}% coverage)."
+        )
+
+    for p in passed_checks:
+        reasons.append(f"✓ {p}")
+    for f in failed_checks:
+        reasons.append(f"✗ {f}")
+    for n in not_eval_checks:
+        reasons.append(f"— Not evaluated: {n}")
+
+    return reasons
+
+
+def _build_recommended_action(label: str) -> str:
+    lbl = (label or "").lower().strip()
+    if "genuine" in lbl:
+        return getattr(
+            settings,
+            "PREDICTION_ACTION_GENUINE",
+            "Accept certificate — credential verified against institutional and forensic standards."
+        )
+    elif "inconclusive" in lbl:
+        return getattr(
+            settings,
+            "PREDICTION_ACTION_INCONCLUSIVE",
+            "Request original hardcopy or direct verification from the issuing institution (insufficient evidence coverage / inconclusive)."
+        )
+    elif "suspicious" in lbl:
+        return getattr(
+            settings,
+            "PREDICTION_ACTION_SUSPICIOUS",
+            "Manual review required — escalate to admissions/compliance officer for secondary inspection."
+        )
+    else: # fake / likely_forged
+        return getattr(
+            settings,
+            "PREDICTION_ACTION_FAKE",
+            "Reject certificate — evidence indicates tampering, credential collision, or cryptographic forgery."
+        )
+
 
 def _build_evidence(inputs: PredictionInputs) -> dict:
-    """
-    Construct the spec-compliant evidence dict.
-    Prefers evidence_breakdown from the trust score engine where available,
-    falls back to deriving from raw inputs.
-    """
     eb = inputs.evidence_breakdown or {}
 
     def _get(key: str, default: dict) -> dict:
@@ -230,43 +423,31 @@ def _build_evidence(inputs: PredictionInputs) -> dict:
     # OCR
     if inputs.ocr_accuracy is not None:
         ocr_score = round(inputs.ocr_accuracy * 100, 1)
-        evidence["ocr"] = {
-            "score": ocr_score,
-            "status": _pass_warn_fail(ocr_score, 85, 70),
-        }
+        evidence["ocr"] = {"score": ocr_score, "status": "PASS" if ocr_score >= 80 else ("WARN" if ocr_score >= 60 else "FAIL")}
     else:
         evidence["ocr"] = {"score": None, "status": "UNAVAILABLE"}
 
     # Classification
     if inputs.doc_classification_confidence is not None:
         cls_score = round(inputs.doc_classification_confidence * 100, 1)
-        evidence["classification"] = {
-            "score": cls_score,
-            "status": _pass_warn_fail(cls_score, 80, 60),
-        }
+        evidence["classification"] = {"score": cls_score, "status": "PASS" if cls_score >= 80 else ("WARN" if cls_score >= 60 else "FAIL")}
     else:
         evidence["classification"] = _get("classification", {"score": None, "status": "UNAVAILABLE"})
 
     # Field extraction
     if inputs.field_extraction_completeness is not None:
         fe_score = round(inputs.field_extraction_completeness * 100, 1)
-        evidence["field_extraction"] = {
-            "score": fe_score,
-            "status": _pass_warn_fail(fe_score, 80, 60),
-        }
+        evidence["field_extraction"] = {"score": fe_score, "status": "PASS" if fe_score >= 80 else ("WARN" if fe_score >= 60 else "FAIL")}
     else:
         evidence["field_extraction"] = _get("field_extraction", {"score": None, "status": "UNAVAILABLE"})
 
-    # Document comparison
+    # Comparison
     if inputs.comparison_consistency_pct is not None:
-        evidence["comparison"] = {
-            "score": round(inputs.comparison_consistency_pct, 1),
-            "status": _pass_warn_fail(inputs.comparison_consistency_pct, 80, 60),
-        }
+        evidence["comparison"] = {"score": round(inputs.comparison_consistency_pct, 1), "status": "PASS" if inputs.comparison_consistency_pct >= 80 else "FAIL"}
     else:
         evidence["comparison"] = {"score": None, "status": "UNAVAILABLE"}
 
-    # QR verification
+    # QR
     if inputs.qr_present is None:
         evidence["qr"] = {"status": "NOT_CHECKED"}
     elif not inputs.qr_present:
@@ -277,13 +458,12 @@ def _build_evidence(inputs: PredictionInputs) -> dict:
         evidence["qr"] = {"status": "INVALID"}
 
     # Blockchain
-    if inputs.blockchain_status is None:
-        evidence["blockchain"] = {"status": "NOT_CHECKED"}
-    elif inputs.blockchain_status == "unavailable":
+    bc = (inputs.blockchain_status or "").lower()
+    if bc in ("", "unavailable"):
         evidence["blockchain"] = {"status": "NOT_AVAILABLE"}
-    elif inputs.blockchain_status == "verified":
+    elif bc == "verified":
         evidence["blockchain"] = {"status": "MATCH"}
-    elif inputs.blockchain_status == "mismatch":
+    elif bc == "mismatch":
         evidence["blockchain"] = {"status": "MISMATCH"}
     else:
         evidence["blockchain"] = {"status": "NOT_REGISTERED"}
@@ -293,319 +473,23 @@ def _build_evidence(inputs: PredictionInputs) -> dict:
         ts = inputs.tampering_score
         evidence["tampering"] = {
             "score": round(ts, 1),
-            "status": "LOW_RISK" if ts < 30 else ("MEDIUM_RISK" if ts < 60 else "HIGH_RISK"),
+            "status": "LOW_RISK" if ts < 25 else ("MEDIUM_RISK" if ts < 60 else "HIGH_RISK"),
         }
     else:
         evidence["tampering"] = {"score": None, "status": "NOT_CHECKED"}
 
     # Duplicate
-    dup_status = (inputs.duplicate_status or "").lower()
     same_owner = bool(inputs.duplicate_same_owner)
-    is_own = dup_status == "own_reupload" or (
-        same_owner and not ("altered" in dup_status or dup_status.startswith("suspicious"))
-        and (inputs.duplicate_type == "EXACT_FILE_DUPLICATE" or not inputs.duplicate_type)
-    )
-    is_altered = (
-        "altered" in dup_status
-        or dup_status in ("suspicious: altered re-upload", "suspicious_altered_reupload")
-        or (inputs.duplicate_type or "").upper() == "ALTERED_REUPLOAD"
-    )
-
+    dup_st = (inputs.duplicate_status or "").lower()
+    is_own = dup_st == "own_reupload" or same_owner
     if inputs.is_duplicate is None:
         evidence["duplicate"] = {"status": "NOT_CHECKED"}
     elif not inputs.is_duplicate:
         evidence["duplicate"] = {"status": "NOT_FOUND"}
     elif is_own:
-        evidence["duplicate"] = {"status": "OWN_REUPLOAD", "label": "You already uploaded this exact file"}
-    elif is_altered:
-        evidence["duplicate"] = {"status": "ALTERED_REUPLOAD", "label": "Suspicious: altered re-upload with different file content"}
+        evidence["duplicate"] = {"status": "OWN_REUPLOAD"}
     else:
         evidence["duplicate"] = {"status": "DUPLICATE"}
 
-    # Metadata (from trust score engine or default clean)
     evidence["metadata"] = _get("metadata", {"status": "CLEAN"})
-
     return evidence
-
-
-# ---------------------------------------------------------------------------
-# Reasons builder
-# ---------------------------------------------------------------------------
-
-def _build_reasons(
-    inputs: PredictionInputs,
-    label: str,
-    score: float,
-    fp: float,
-    missing_critical: list[str] | None = None,
-    completed_checks: int | None = None,
-    total_checks: int | None = None,
-    partial_note: str | None = None,
-) -> list[str]:
-    reasons: list[str] = []
-
-    if missing_critical:
-        reasons.append(f"⚠ Critical verification check(s) incomplete: {', '.join(missing_critical)}")
-    if partial_note:
-        reasons.append(f"ℹ {partial_note}")
-
-    # OCR
-    if inputs.ocr_accuracy is not None:
-        pct = round(inputs.ocr_accuracy * 100)
-        if pct >= 85:
-            reasons.append(f"✓ OCR confidence: {pct}% (high)")
-        elif pct >= 70:
-            reasons.append(f"⚠ OCR confidence: {pct}% (medium — some fields may need verification)")
-        else:
-            reasons.append(f"⚠ OCR confidence: {pct}% (low — extracted fields may be unreliable)")
-
-    # Classification
-    if inputs.doc_classification_confidence is not None:
-        pct = round(inputs.doc_classification_confidence * 100)
-        if pct >= 80:
-            reasons.append(f"✓ Document type classified with {pct}% confidence")
-        else:
-            reasons.append(f"⚠ Document type classification confidence is low ({pct}%)")
-
-    # Field extraction
-    if inputs.field_extraction_completeness is not None:
-        pct = round(inputs.field_extraction_completeness * 100)
-        if pct >= 80:
-            reasons.append(f"✓ {pct}% of expected fields were extracted successfully")
-        else:
-            reasons.append(f"⚠ Only {pct}% of expected fields could be extracted")
-
-    # Comparison
-    if inputs.comparison_consistency_pct is not None:
-        pct = round(inputs.comparison_consistency_pct)
-        if pct >= 80:
-            reasons.append(f"✓ Cross-document comparison: {pct}% consistency")
-        elif pct >= 60:
-            reasons.append(f"⚠ Cross-document comparison shows partial consistency ({pct}%)")
-        else:
-            reasons.append(f"✗ Cross-document comparison found significant inconsistencies ({pct}%)")
-    else:
-        reasons.append("— Document comparison not run (single document verification)")
-
-    # QR
-    if inputs.qr_present is None:
-        reasons.append("— QR verification not checked")
-    elif not inputs.qr_present:
-        reasons.append("— No QR code found on document (not automatically suspicious)")
-    elif inputs.qr_valid:
-        reasons.append("✓ QR code verified successfully")
-    else:
-        reasons.append("✗ QR code validation failed — possible forgery indicator")
-
-    # Blockchain
-    if inputs.blockchain_status == "verified":
-        reasons.append("✓ Blockchain hash matched — document integrity confirmed")
-    elif inputs.blockchain_status == "mismatch":
-        reasons.append("✗ Blockchain hash MISMATCH — document may have been altered after registration")
-    elif inputs.blockchain_status == "not_found":
-        reasons.append("— Hash not found on blockchain (document may not be registered)")
-    elif inputs.blockchain_status == "unavailable":
-        reasons.append("— Blockchain verification unavailable (infrastructure not configured)")
-
-    # Tampering
-    tamp_st = (inputs.tampering_status or "").lower()
-    if inputs.tampering_score is not None:
-        ts = round(inputs.tampering_score)
-        if ts < 30:
-            reasons.append(f"✓ No significant tampering evidence detected (score {ts}/100)")
-        elif ts < 60:
-            reasons.append(f"⚠ Some tampering indicators detected (score {ts}/100) — review recommended")
-        else:
-            reasons.append(f"✗ Strong tampering evidence detected (score {ts}/100)")
-    elif tamp_st == "not_applicable_for_pdf_text_layer":
-        reasons.append("ℹ Tampering analysis: digital PDF text layer (raster tampering scan not applicable)")
-    elif tamp_st.startswith("failed"):
-        reasons.append(f"✗ Tampering analysis failed: {inputs.tampering_status}")
-    else:
-        reasons.append("— Tampering analysis not run")
-
-    # Duplicate
-    dup_status = (inputs.duplicate_status or "").lower()
-    same_owner = bool(inputs.duplicate_same_owner)
-    is_own = dup_status == "own_reupload" or (
-        same_owner and not ("altered" in dup_status or dup_status.startswith("suspicious"))
-        and (inputs.duplicate_type == "EXACT_FILE_DUPLICATE" or not inputs.duplicate_type)
-    )
-    is_altered = (
-        "altered" in dup_status
-        or dup_status in ("suspicious: altered re-upload", "suspicious_altered_reupload")
-        or (inputs.duplicate_type or "").upper() == "ALTERED_REUPLOAD"
-    )
-
-    if inputs.is_duplicate is None:
-        reasons.append("— Duplicate check not run")
-    elif not inputs.is_duplicate:
-        reasons.append("✓ No duplicate certificate detected")
-    elif is_own:
-        reasons.append("ℹ You already uploaded this exact file")
-    elif is_altered:
-        reasons.append("⚠ Suspicious: altered re-upload with different file content for the same register number")
-    else:
-        reasons.append("✗ Duplicate certificate detected — credentials already registered by another account")
-
-    # Critical overrides
-    if inputs.critical_overrides:
-        for override in inputs.critical_overrides:
-            if "blockchain_mismatch" in override:
-                reasons.append("⚠ Blockchain mismatch triggered fraud probability floor (strong negative evidence)")
-            elif "qr_invalid" in override:
-                reasons.append("⚠ Invalid QR code triggered fraud probability floor")
-            elif "tampering_severe" in override:
-                reasons.append("⚠ Severe tampering score triggered fraud probability floor")
-            elif "duplicate_floor" in override:
-                reasons.append("⚠ Duplicate detection triggered maximum fraud probability floor")
-
-    # Data completeness note
-    if inputs.data_completeness < 0.5:
-        reasons.append(
-            f"⚠ Only {round(inputs.data_completeness * 100)}% of verification checks completed "
-            f"— this verdict is based on partial evidence"
-        )
-
-    return reasons
-
-
-# ---------------------------------------------------------------------------
-# Helpers (unchanged from original, preserved for backward compatibility)
-# ---------------------------------------------------------------------------
-
-def _pass_warn_fail(value: float, pass_threshold: float, warn_threshold: float) -> str:
-    if value >= pass_threshold:
-        return "PASS"
-    if value >= warn_threshold:
-        return "WARN"
-    return "FAIL"
-
-
-def _boundary_distance(score: float, label: str) -> float:
-    if label == "genuine":
-        return min((score - GENUINE_THRESHOLD) / 20.0, 1.0)
-    if label == "fake":
-        return min((SUSPICIOUS_THRESHOLD - score) / SUSPICIOUS_THRESHOLD, 1.0)
-    dist_from_lower = score - SUSPICIOUS_THRESHOLD
-    dist_from_upper = GENUINE_THRESHOLD - score
-    return min(min(dist_from_lower, dist_from_upper) / 15.0, 1.0)
-
-
-def _build_explanation(
-    inputs: PredictionInputs,
-    label: str,
-    score: float,
-    missing_critical: list[str] | None = None,
-    partial_note: str | None = None,
-) -> str:
-    """Plain text explanation — preserved for backward compatibility."""
-    parts = [f"This certificate received a Trust Score of {score:.1f}/100."]
-
-    if missing_critical:
-        parts.append(f"Verification is incomplete: missing critical checks ({', '.join(missing_critical)}).")
-    if partial_note:
-        parts.append(f"{partial_note}.")
-
-    if inputs.is_duplicate:
-        dup_status = (inputs.duplicate_status or "").lower()
-        same_owner = bool(inputs.duplicate_same_owner)
-        is_own = dup_status == "own_reupload" or (
-            same_owner and not ("altered" in dup_status or dup_status.startswith("suspicious"))
-            and (inputs.duplicate_type == "EXACT_FILE_DUPLICATE" or not inputs.duplicate_type)
-        )
-        is_altered = (
-            "altered" in dup_status
-            or dup_status in ("suspicious: altered re-upload", "suspicious_altered_reupload")
-            or (inputs.duplicate_type or "").upper() == "ALTERED_REUPLOAD"
-        )
-
-        if is_own:
-            parts.append("You already uploaded this exact file (benign re-upload, not treated as fraud).")
-        elif is_altered:
-            parts.append(
-                "This document matches your previous register number but has different file content, "
-                "flagging it as a suspicious altered re-upload."
-            )
-        else:
-            parts.append(
-                "It was flagged as a duplicate of another certificate already in the system "
-                "— this alone is treated as strong fraud evidence."
-            )
-
-    tamp_st = (inputs.tampering_status or "").lower()
-    if inputs.tampering_score is not None:
-        if inputs.tampering_score >= 60:
-            parts.append(f"Tampering analysis found significant indicators of editing (score {inputs.tampering_score:.0f}/100).")
-        elif inputs.tampering_score >= 30:
-            parts.append(f"Tampering analysis found some minor indicators worth reviewing (score {inputs.tampering_score:.0f}/100).")
-        else:
-            parts.append("No significant signs of tampering were detected.")
-    elif tamp_st == "not_applicable_for_pdf_text_layer":
-        parts.append("Tampering scan not applicable for digital vector PDF text layer.")
-    elif tamp_st.startswith("failed"):
-        parts.append(f"Tampering scan failed: {inputs.tampering_status}.")
-
-    if inputs.blockchain_status == "verified":
-        parts.append("Its hash matches a record on the blockchain.")
-    elif inputs.blockchain_status == "mismatch":
-        parts.append("Its hash does NOT match the on-chain record — a strong red flag.")
-    elif inputs.blockchain_status == "not_found":
-        parts.append("Its hash was not found on the blockchain (it may simply not be registered yet).")
-
-    if inputs.qr_present is False:
-        parts.append("No QR code was found on the document.")
-    elif inputs.qr_valid is False:
-        parts.append("The QR code on the document failed validation.")
-    elif inputs.qr_valid is True:
-        parts.append("Its QR code validated successfully.")
-
-    if inputs.comparison_consistency_pct is not None:
-        if inputs.comparison_consistency_pct < 70:
-            parts.append(f"Cross-document comparison found inconsistencies ({inputs.comparison_consistency_pct:.0f}% consistency).")
-        else:
-            parts.append(f"Cross-document comparison was consistent ({inputs.comparison_consistency_pct:.0f}%).")
-
-    if inputs.ocr_accuracy is not None and inputs.ocr_accuracy < 0.6:
-        parts.append("OCR extraction confidence was low, so some extracted fields may need manual verification.")
-
-    if inputs.data_completeness < 0.5:
-        parts.append("Note: not all verification checks have been run yet, so this assessment is based on partial data.")
-
-    return " ".join(parts)
-
-
-def _build_recommended_action(label: str, inputs: PredictionInputs | bool | None = None) -> str:
-    if isinstance(inputs, bool):
-        is_dup = inputs
-        is_own = False
-        is_altered = False
-    elif inputs is None:
-        is_dup = False
-        is_own = False
-        is_altered = False
-    else:
-        is_dup = bool(inputs.is_duplicate)
-        dup_status = (inputs.duplicate_status or "").lower()
-        same_owner = bool(inputs.duplicate_same_owner)
-        is_own = dup_status == "own_reupload" or (
-            same_owner and not ("altered" in dup_status or dup_status.startswith("suspicious"))
-            and (inputs.duplicate_type == "EXACT_FILE_DUPLICATE" or not inputs.duplicate_type)
-        )
-        is_altered = (
-            "altered" in dup_status
-            or dup_status in ("suspicious: altered re-upload", "suspicious_altered_reupload")
-            or (inputs.duplicate_type or "").upper() == "ALTERED_REUPLOAD"
-        )
-
-    if is_dup and not is_own and not is_altered:
-        return "Reject this certificate and flag it for investigation — it duplicates another certificate already on file."
-    if is_dup and is_altered:
-        return "Manual review recommended — same register number was previously uploaded with different file content."
-    if label == "genuine":
-        return "No further action needed. This certificate passed verification."
-    if label in ("inconclusive", "inconclusive / needs review"):
-        return "Inconclusive / needs review — manual inspection required due to incomplete verification checks or missing external anchor."
-    if label == "suspicious":
-        return "Manual review recommended before relying on this certificate. Check the flagged factors above."
-    return "Reject this certificate. Consider contacting the issuing institution to confirm its authenticity."

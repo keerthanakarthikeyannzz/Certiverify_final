@@ -1,13 +1,14 @@
 "use client";
-import React, { Suspense, useState } from "react";
+import React, { Suspense, useState, useEffect } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { authApi, setTokens } from "@/lib/api";
-import { AxiosError } from "axios";
+import { formatErrorMessage } from "@/lib/errorHandler";
 import { Logo } from "@/components/ui/Logo";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { AlertCircle, CheckCircle2, ArrowRight } from "lucide-react";
+import { ConnectionStatus } from "@/components/ui/ConnectionStatus";
+import { AlertCircle, CheckCircle2 } from "lucide-react";
 
 function LoginForm() {
   const router = useRouter();
@@ -16,25 +17,30 @@ function LoginForm() {
 
   const [form, setForm] = useState({ email: "", password: "" });
   const [error, setError] = useState<string | null>(null);
-  const [unverifiedEmail, setUnverifiedEmail] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  // Auto-clear error when backend status recovers
+  useEffect(() => {
+    const handleStatus = (e: Event) => {
+      const customEvent = e as CustomEvent<{ online: boolean }>;
+      if (customEvent.detail?.online && error && error.includes("Can't reach the verification server")) {
+        setError(null);
+      }
+    };
+    window.addEventListener("backend-status-change", handleStatus);
+    return () => window.removeEventListener("backend-status-change", handleStatus);
+  }, [error]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    setUnverifiedEmail(null);
     setLoading(true);
     try {
       const { data } = await authApi.login(form);
       setTokens(data.access_token, data.refresh_token);
       router.push("/dashboard/upload");
     } catch (err) {
-      const axErr = err as AxiosError<{ detail?: string }>;
-      const detail = axErr.response?.data?.detail || "Login failed. Check your credentials.";
-      setError(detail);
-      if (axErr.response?.status === 403 && /verif/i.test(detail)) {
-        setUnverifiedEmail(form.email);
-      }
+      setError(formatErrorMessage(err, "Login failed. Check your credentials."));
     } finally {
       setLoading(false);
     }
@@ -48,6 +54,9 @@ function LoginForm() {
         <p className="text-xs text-slate-500 max-w-xs">
           Sign in to access document verification, forensic auditing, and trust scores.
         </p>
+        <div className="pt-1">
+          <ConnectionStatus />
+        </div>
       </div>
 
       {justRegistered && (
@@ -57,25 +66,12 @@ function LoginForm() {
         </div>
       )}
 
-      {unverifiedEmail ? (
-        <div className="p-3.5 bg-amber-50 border border-amber-200 text-amber-900 rounded-lg space-y-2 text-xs">
-          <div className="flex items-start gap-2">
-            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-            <span className="font-semibold">{error}</span>
-          </div>
-          <Link
-            href={`/verify-email?email=${encodeURIComponent(unverifiedEmail)}`}
-            className="inline-flex items-center gap-1 font-semibold text-indigo-600 hover:text-indigo-700 hover:underline pt-1"
-          >
-            Verify your email with OTP <ArrowRight className="w-3.5 h-3.5" />
-          </Link>
-        </div>
-      ) : error ? (
-        <div className="flex items-start gap-2 p-3 bg-red-50 border border-red-200 text-red-800 rounded-lg text-xs">
+      {error && (
+        <div className="flex items-start gap-2 p-3 bg-red-50 border border-red-200 text-red-800 rounded-lg text-xs leading-relaxed">
           <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
           <span>{error}</span>
         </div>
-      ) : null}
+      )}
 
       <form onSubmit={handleSubmit} className="space-y-4">
         <Input

@@ -15,6 +15,10 @@ import {
   ExternalLink,
   Copy,
   Check,
+  ShieldCheck,
+  Search,
+  CheckCircle,
+  XCircle,
 } from "lucide-react";
 import {
   certificateApi,
@@ -24,6 +28,7 @@ import {
   CertificateResponse,
   VerificationReportResponse,
   VerificationResultResponse,
+  ReportListItem,
 } from "@/lib/api";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
@@ -42,7 +47,31 @@ export default function VerificationReportsPage() {
   const [verification, setVerification] = useState<VerificationResultResponse | null>(null);
   const [loadingReport, setLoadingReport] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [generationStep, setGenerationStep] = useState<string>("");
   const [copiedHash, setCopiedHash] = useState(false);
+  const [copiedSig, setCopiedSig] = useState(false);
+
+  // All Generated Reports list
+  const [reportsList, setReportsList] = useState<ReportListItem[]>([]);
+  const [loadingList, setLoadingList] = useState(true);
+  const [searchFilter, setSearchFilter] = useState("");
+
+  // Signature verification modal/state
+  const [verifyingCertId, setVerifyingCertId] = useState<string | null>(null);
+  const [downloadingCertId, setDownloadingCertId] = useState<string | null>(null);
+  const [sigStatus, setSigStatus] = useState<{
+    certId: string;
+    isValid: boolean;
+    detail: string;
+  } | null>(null);
+
+  const fetchReportsList = () => {
+    reportApi
+      .list()
+      .then((res) => setReportsList(res.data))
+      .catch(() => setReportsList([]))
+      .finally(() => setLoadingList(false));
+  };
 
   useEffect(() => {
     if (!getAccessToken()) {
@@ -60,6 +89,8 @@ export default function VerificationReportsPage() {
       })
       .catch(() => setCertificates([]))
       .finally(() => setLoadingCerts(false));
+
+    fetchReportsList();
   }, [router]);
 
   useEffect(() => {
@@ -68,6 +99,7 @@ export default function VerificationReportsPage() {
     setLoadingReport(true);
     setReport(null);
     setVerification(null);
+    setSigStatus(null);
 
     Promise.allSettled([
       reportApi.get(selectedCertId),
@@ -83,22 +115,75 @@ export default function VerificationReportsPage() {
   const handleGenerateReport = async () => {
     if (!selectedCertId) return;
     setGenerating(true);
+    setGenerationStep("Gathering verified pipeline evidence...");
+
+    const stepTimer1 = setTimeout(() => {
+      setGenerationStep("Compiling PDF tables & ELA heatmaps...");
+    }, 600);
+
+    const stepTimer2 = setTimeout(() => {
+      setGenerationStep("Applying HMAC-SHA256 digital signature...");
+    }, 1200);
+
     try {
       const { data } = await reportApi.generate(selectedCertId);
+      clearTimeout(stepTimer1);
+      clearTimeout(stepTimer2);
       setReport(data);
-    } catch {
-      alert("Failed to generate verification report.");
+      fetchReportsList();
+    } catch (err: any) {
+      clearTimeout(stepTimer1);
+      clearTimeout(stepTimer2);
+      alert("Failed to generate verification report: " + (err?.response?.data?.detail || err?.message || "Unknown error"));
     } finally {
       setGenerating(false);
+      setGenerationStep("");
     }
   };
 
-  const handleDownloadReport = () => {
-    if (!selectedCertId) return;
-    const url = reportApi.downloadUrl(selectedCertId);
-    const token = getAccessToken();
-    const directUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url;
-    window.open(directUrl, "_blank");
+  const handleDownloadReport = async (certId?: string) => {
+    const targetId = certId || selectedCertId;
+    if (!targetId) return;
+    setDownloadingCertId(targetId);
+    try {
+      await reportApi.download(targetId);
+    } catch (err: any) {
+      console.error("Failed to download report:", err);
+      alert("Failed to download verification report: " + (err?.message || "Please try again."));
+    } finally {
+      setDownloadingCertId(null);
+    }
+  };
+
+  const handleViewReport = async (certId?: string) => {
+    const targetId = certId || selectedCertId;
+    if (!targetId) return;
+    try {
+      await reportApi.viewInline(targetId);
+    } catch (err: any) {
+      console.error("Failed to view report:", err);
+      alert("Failed to preview verification report: " + (err?.message || "Please try again."));
+    }
+  };
+
+  const handleVerifySignature = async (certId: string) => {
+    setVerifyingCertId(certId);
+    try {
+      const res = await reportApi.verifySignature(certId);
+      setSigStatus({
+        certId,
+        isValid: res.data.is_valid,
+        detail: res.data.detail,
+      });
+    } catch (err: any) {
+      setSigStatus({
+        certId,
+        isValid: false,
+        detail: err?.response?.data?.detail || "Verification request failed",
+      });
+    } finally {
+      setVerifyingCertId(null);
+    }
   };
 
   const selectedCert = certificates.find((c) => c.id === selectedCertId);
@@ -110,8 +195,26 @@ export default function VerificationReportsPage() {
     setTimeout(() => setCopiedHash(false), 2000);
   };
 
+  const handleCopySig = (sig?: string) => {
+    if (!sig) return;
+    navigator.clipboard.writeText(sig);
+    setCopiedSig(true);
+    setTimeout(() => setCopiedSig(false), 2000);
+  };
+
+  const filteredReports = reportsList.filter((r) => {
+    if (!searchFilter.trim()) return true;
+    const q = searchFilter.toLowerCase();
+    return (
+      r.verification_id?.toLowerCase().includes(q) ||
+      r.certificate_filename?.toLowerCase().includes(q) ||
+      r.sha256_hash?.toLowerCase().includes(q) ||
+      r.prediction_label?.toLowerCase().includes(q)
+    );
+  });
+
   return (
-    <div className="p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto space-y-6">
+    <div className="p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto space-y-8">
       {/* Page Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white border border-slate-200 p-6 rounded-xl shadow-sm">
         <div>
@@ -124,17 +227,17 @@ export default function VerificationReportsPage() {
           </div>
           <h1 className="text-xl font-bold text-slate-900 flex items-center gap-2 tracking-tight">
             <FileText size={22} className="text-indigo-600" />
-            Official Verification Reports & Audit Certificates
+            Official Verification Reports & Audit Dossiers
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Generate and download cryptographically signed verification reports with SHA-256 integrity proofs.
+            Generate, download, and cryptographically verify PDF reports with HMAC-SHA256 integrity proofs.
           </p>
         </div>
 
         {/* Certificate Selector Dropdown */}
-        <div className="w-64 shrink-0">
+        <div className="w-72 shrink-0">
           <label className="text-[11px] font-semibold text-slate-500 uppercase block mb-1">
-            Select Certificate
+            Active Certificate Dossier
           </label>
           <select
             value={selectedCertId}
@@ -243,7 +346,7 @@ export default function VerificationReportsPage() {
               {/* Verification Pipeline Outcomes Summary */}
               <div className="space-y-3 pt-2">
                 <h3 className="text-xs font-mono uppercase text-slate-500 font-bold">
-                  Verification Pipeline Outcomes
+                  Verification Pipeline Telemetry
                 </h3>
                 {verification ? (
                   <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 font-mono text-xs">
@@ -291,19 +394,41 @@ export default function VerificationReportsPage() {
                 )}
               </div>
 
-              {/* Report Digital Signature (if generated) */}
+              {/* Report Digital Signature & Verification Box */}
               {report && (
-                <div className="p-4 bg-emerald-50/50 border border-emerald-200 rounded-xl space-y-2">
-                  <div className="flex items-center gap-2 text-xs font-mono font-bold text-emerald-800">
-                    <Lock size={14} />
-                    <span>DIGITAL SIGNATURE & AUDIT REF</span>
+                <div className="p-4 bg-emerald-50/50 border border-emerald-200 rounded-xl space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2 text-xs font-mono font-bold text-emerald-800">
+                      <Lock size={14} />
+                      <span>DETACHED HMAC-SHA256 DIGITAL SIGNATURE</span>
+                    </div>
+                    <button
+                      onClick={() => handleCopySig(report.digital_signature)}
+                      className="text-xs text-emerald-700 hover:underline flex items-center gap-1 font-mono"
+                    >
+                      {copiedSig ? <Check size={11} /> : <Copy size={11} />}
+                      {copiedSig ? "Copied" : "Copy Signature"}
+                    </button>
                   </div>
-                  <p className="font-mono text-[11px] text-emerald-900 break-all">
-                    Sig: {report.digital_signature || `CERTIVERIFY-SIG-${report.id.slice(0, 16)}`}
+                  <p className="font-mono text-[11px] text-emerald-900 break-all bg-white p-2.5 rounded border border-emerald-200">
+                    {report.digital_signature || "N/A"}
                   </p>
-                  <div className="text-[11px] font-mono text-slate-500">
-                    Generated: {new Date(report.generated_at).toLocaleString()}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[11px] font-mono text-slate-500">
+                    <span>Generated: {new Date(report.generated_at).toLocaleString()}</span>
+                    <span>Ref ID: <b>{report.verification_id}</b></span>
                   </div>
+
+                  {/* Real-time signature verification result */}
+                  {sigStatus && sigStatus.certId === selectedCert.id && (
+                    <div className={`mt-2 p-3 rounded-lg border text-xs flex items-center gap-2 font-mono ${
+                      sigStatus.isValid
+                        ? "bg-emerald-100/70 border-emerald-300 text-emerald-900"
+                        : "bg-rose-100/70 border-rose-300 text-rose-900"
+                    }`}>
+                      {sigStatus.isValid ? <CheckCircle size={16} className="text-emerald-600 shrink-0" /> : <XCircle size={16} className="text-rose-600 shrink-0" />}
+                      <span>{sigStatus.detail}</span>
+                    </div>
+                  )}
                 </div>
               )}
             </CardContent>
@@ -313,25 +438,68 @@ export default function VerificationReportsPage() {
           <Card className="lg:col-span-4 h-fit">
             <CardHeader className="pb-3 border-b border-slate-100">
               <CardTitle className="text-sm font-semibold text-slate-900">
-                Report Generation & Actions
+                Report Generation & Integrity
               </CardTitle>
             </CardHeader>
 
             <CardContent className="p-5 space-y-4 text-xs text-slate-600">
               <p className="leading-relaxed">
-                Verification reports compile all OCR field extractions, tamper ELA heatmaps, blockchain logs, and AI predictions into an official signed PDF dossier.
+                Verification reports compile all OCR extractions, tamper ELA heatmaps, blockchain logs, trust scores, and AI predictions into a sealed PDF dossier.
               </p>
 
-              {report ? (
-                <Button
-                  onClick={handleDownloadReport}
-                  variant="primary"
-                  size="md"
-                  icon={<Download size={15} />}
-                  className="w-full bg-emerald-600 hover:bg-emerald-700 shadow-sm"
-                >
-                  Download Signed PDF Report
-                </Button>
+              {generating ? (
+                <div className="p-4 bg-indigo-50 border border-indigo-200 rounded-lg space-y-2 text-center">
+                  <RefreshCw size={20} className="animate-spin text-indigo-600 mx-auto" />
+                  <p className="font-semibold text-indigo-900 text-xs">Generating Report</p>
+                  <p className="text-[11px] text-indigo-700 font-mono">{generationStep}</p>
+                </div>
+              ) : report ? (
+                <div className="space-y-2">
+                  <Button
+                    onClick={() => handleDownloadReport(selectedCert.id)}
+                    disabled={downloadingCertId === selectedCert.id}
+                    loading={downloadingCertId === selectedCert.id}
+                    variant="primary"
+                    size="md"
+                    icon={<Download size={15} />}
+                    className="w-full bg-emerald-600 hover:bg-emerald-700 shadow-sm"
+                  >
+                    Download Signed PDF Report
+                  </Button>
+
+                  <Button
+                    onClick={() => handleViewReport(selectedCert.id)}
+                    variant="secondary"
+                    size="sm"
+                    icon={<ExternalLink size={14} />}
+                    className="w-full text-xs"
+                  >
+                    View Report in Browser
+                  </Button>
+
+                  <Button
+                    onClick={() => handleVerifySignature(selectedCert.id)}
+                    disabled={verifyingCertId === selectedCert.id}
+                    loading={verifyingCertId === selectedCert.id}
+                    variant="secondary"
+                    size="sm"
+                    icon={<ShieldCheck size={14} className="text-indigo-600" />}
+                    className="w-full text-xs"
+                  >
+                    Verify Cryptographic Signature
+                  </Button>
+
+                  <Button
+                    onClick={handleGenerateReport}
+                    disabled={generating}
+                    variant="ghost"
+                    size="sm"
+                    icon={<RefreshCw size={12} />}
+                    className="w-full text-xs text-slate-500"
+                  >
+                    Re-Generate Report (New Version)
+                  </Button>
+                </div>
               ) : (
                 <Button
                   onClick={handleGenerateReport}
@@ -342,21 +510,7 @@ export default function VerificationReportsPage() {
                   icon={<Sparkles size={15} />}
                   className="w-full shadow-sm"
                 >
-                  {generating ? "Generating..." : "Generate PDF Report"}
-                </Button>
-              )}
-
-              {report && (
-                <Button
-                  onClick={handleGenerateReport}
-                  disabled={generating}
-                  loading={generating}
-                  variant="ghost"
-                  size="sm"
-                  icon={<RefreshCw size={12} />}
-                  className="w-full text-xs"
-                >
-                  Re-Generate Report
+                  Generate PDF Report
                 </Button>
               )}
 
@@ -374,6 +528,143 @@ export default function VerificationReportsPage() {
           </Card>
         </div>
       )}
+
+      {/* Bottom Section: All Generated Reports Table */}
+      <Card>
+        <CardHeader className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
+          <div>
+            <CardTitle className="text-base font-bold text-slate-900 flex items-center gap-2">
+              <FileText size={18} className="text-indigo-600" />
+              Generated Verification Reports
+            </CardTitle>
+            <CardDescription className="text-xs text-slate-500 mt-0.5">
+              Repository of all official verification reports generated within your tenant organization.
+            </CardDescription>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <div className="relative w-64">
+              <Search size={14} className="absolute left-3 top-2.5 text-slate-400" />
+              <input
+                type="text"
+                placeholder="Search by ID, file, verdict..."
+                value={searchFilter}
+                onChange={(e) => setSearchFilter(e.target.value)}
+                className="w-full pl-9 pr-3 py-1.5 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600 font-mono"
+              />
+            </div>
+            <Button
+              onClick={fetchReportsList}
+              variant="secondary"
+              size="sm"
+              icon={<RefreshCw size={13} />}
+            >
+              Refresh
+            </Button>
+          </div>
+        </CardHeader>
+
+        <CardContent className="p-0">
+          {loadingList ? (
+            <div className="p-8 text-center text-xs text-slate-400">Loading generated reports...</div>
+          ) : filteredReports.length === 0 ? (
+            <div className="p-8 text-center text-xs text-slate-400">
+              {searchFilter ? "No reports match your filter." : "No reports have been generated yet."}
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-mono text-[11px] uppercase tracking-wider">
+                    <th className="py-3 px-4">Verification ID</th>
+                    <th className="py-3 px-4">Certificate Name</th>
+                    <th className="py-3 px-4">Generated At</th>
+                    <th className="py-3 px-4">Verdict / Trust</th>
+                    <th className="py-3 px-4">Digital Signature</th>
+                    <th className="py-3 px-4 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 font-mono">
+                  {filteredReports.map((item) => (
+                    <tr key={item.id} className="hover:bg-slate-50/80 transition-colors">
+                      <td className="py-3 px-4">
+                        <span className="font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded text-[11px]">
+                          {item.verification_id}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className="text-slate-900 font-medium font-sans block">
+                          {item.certificate_filename}
+                        </span>
+                        <span className="text-[10px] text-slate-400 uppercase">
+                          {item.file_type} • {item.sha256_hash.slice(0, 10)}…
+                        </span>
+                      </td>
+                      <td className="py-3 px-4 text-slate-600 text-[11px]">
+                        {new Date(item.generated_at).toLocaleString()}
+                      </td>
+                      <td className="py-3 px-4 font-sans">
+                        <div className="flex items-center gap-1.5">
+                          {item.prediction_label ? (
+                            <Badge
+                              variant={
+                                item.prediction_label === "genuine"
+                                  ? "genuine"
+                                  : item.prediction_label === "suspicious"
+                                  ? "suspicious"
+                                  : "fake"
+                              }
+                              size="sm"
+                            >
+                              {item.prediction_label.toUpperCase()}
+                            </Badge>
+                          ) : (
+                            <span className="text-slate-400 text-xs">—</span>
+                          )}
+                          {item.trust_score !== undefined && item.trust_score !== null && (
+                            <span className="text-[11px] text-slate-500 font-mono">
+                              ({Math.round(item.trust_score)}/100)
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="py-3 px-4 text-slate-500 text-[10px]">
+                        <span title={item.digital_signature || ""}>
+                          {item.digital_signature ? `${item.digital_signature.slice(0, 16)}…` : "—"}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        <div className="flex items-center justify-end gap-1.5 font-sans">
+                          <Button
+                            onClick={() => handleVerifySignature(item.certificate_id)}
+                            disabled={verifyingCertId === item.certificate_id}
+                            variant="ghost"
+                            size="sm"
+                            title="Verify Cryptographic Signature"
+                            className="text-indigo-600 hover:text-indigo-800"
+                          >
+                            <ShieldCheck size={14} />
+                          </Button>
+                          <Button
+                            onClick={() => handleDownloadReport(item.certificate_id)}
+                            disabled={downloadingCertId === item.certificate_id}
+                            loading={downloadingCertId === item.certificate_id}
+                            variant="secondary"
+                            size="sm"
+                            icon={<Download size={13} />}
+                          >
+                            Download
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

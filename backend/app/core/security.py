@@ -36,7 +36,10 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 # ---------- JWT ----------
 
 def create_access_token(subject: str, extra_claims: dict[str, Any] | None = None) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    token_minutes = settings.ACCESS_TOKEN_EXPIRE_MINUTES
+    if getattr(settings, "DEV_LONG_LIVED_SESSION", False) and settings.ENV.lower() not in ("production", "prod"):
+        token_minutes = getattr(settings, "DEV_SESSION_EXPIRE_MINUTES", 1440)
+    expire = datetime.now(timezone.utc) + timedelta(minutes=token_minutes)
     payload: dict[str, Any] = {"sub": subject, "exp": expire, "type": "access"}
     if extra_claims:
         payload.update(extra_claims)
@@ -44,8 +47,9 @@ def create_access_token(subject: str, extra_claims: dict[str, Any] | None = None
 
 
 def create_refresh_token(subject: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    payload = {"sub": subject, "exp": expire, "type": "refresh"}
+    token_days = settings.REFRESH_TOKEN_EXPIRE_DAYS
+    expire = datetime.now(timezone.utc) + timedelta(days=token_days)
+    payload = {"sub": subject, "exp": expire, "type": "refresh", "jti": secrets.token_hex(16)}
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 

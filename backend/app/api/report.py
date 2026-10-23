@@ -1,37 +1,59 @@
 """
-MODULE 10 - VERIFICATION REPORT & DASHBOARD API
+MODULE 8 - VERIFICATION REPORT & DASHBOARD API
 
 Endpoints:
   POST   /api/v1/certificates/{certificate_id}/generate-report  → generate PDF, persist VerificationReport
   GET    /api/v1/certificates/{certificate_id}/report           → report metadata
-  GET    /api/v1/certificates/{certificate_id}/download-report  → stream the saved PDF
+  GET    /api/v1/certificates/{certificate_id}/download-report  → stream the saved PDF (scoped auth)
+  POST   /api/v1/certificates/{certificate_id}/verify-signature → verify HMAC-SHA256 signature
+  GET    /api/v1/reports                                        → list all generated reports
   GET    /api/v1/dashboard/stats                                → dashboard aggregate stats
 """
+import asyncio
+import logging
 import os
-import uuid
+import re
+import urllib.parse
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import (
+    get_current_verified_user,
+    get_current_verified_user_flexible,
+    get_owned_certificate,
+    normalize_cert_id,
+)
+from app.core.config import settings
 from app.db.database import get_db
 from app.models.models import (
     Certificate, DocumentComparison, DocumentType, FinalPrediction,
-    FraudAnalysis, OCRData, TrustScore, User, VerificationReport,
-    VerificationResult,
+    FraudAnalysis, OCRData, Organization, TrustScore, User, UserRole,
+    VerificationJob, VerificationReport, VerificationResult,
 )
 from app.schemas.report_schemas import (
     DashboardStatsResponse,
     PredictionDistribution,
     RecentCertificate,
+    ReportListItem,
+    SignatureVerificationResponse,
     TimelineEvent,
     VerificationReportResponse,
 )
-from app.services.report_service import compute_digital_signature, generate_report_pdf
-from app.core.config import settings
-from app.api.deps import get_current_verified_user
+from app.services.audit_service import log_audit_event
+from app.services.report_service import (
+    compute_report_signature,
+    generate_report_pdf,
+    get_report_output_dir,
+    make_verification_id,
+    resolve_report_path,
+    verify_report_signature,
+)
+
+logger = logging.getLogger("certiverify.report_api")
 
 router = APIRouter(tags=["Verification Report"])
 
@@ -40,36 +62,20 @@ router = APIRouter(tags=["Verification Report"])
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_verification_id() -> str:
-    """Human-readable ID: CV-2026-XXXXXXXX"""
-    year = datetime.utcnow().year
-    unique = uuid.uuid4().hex[:8].upper()
-    return f"CV-{year}-{unique}"
-
-
 async def _fetch_one(db: AsyncSession, model, condition):
-    result = await db.execute(select(model).where(condition))
-    return result.scalar_one_or_none()
+    result = await db.execute(select(model).where(condition).order_by(model.id.desc()))
+    return result.scalars().first()
 
 
-def _row_to_dict(row) -> dict:
+def _row_to_dict(row) -> dict | None:
     if row is None:
         return None
     return {c.name: getattr(row, c.name) for c in row.__table__.columns}
 
 
 async def _get_owned_certificate(certificate_id: str, user: User, db: AsyncSession) -> Certificate:
-    result = await db.execute(
-        select(Certificate).where(Certificate.id == certificate_id)
-    )
-    cert = result.scalar_one_or_none()
-    if not cert:
-        raise HTTPException(status_code=404, detail="Certificate not found.")
-
-    from app.api.deps import verify_tenant_access
-    verify_tenant_access(user, cert.organization_id, cert.owner_id)
-    return cert
-
+    from app.api.deps import get_owned_certificate
+    return await get_owned_certificate(certificate_id, user, db)
 
 
 # ---------------------------------------------------------------------------
@@ -91,11 +97,13 @@ async def generate_report(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Aggregates all module data, generates a PDF, persists it, and returns report metadata.
+    Aggregates all stored results, generates an official PDF report,
+    computes an HMAC-SHA256 digital signature, persists it, and returns report metadata.
+    Idempotent: Re-generating safely archives previous PDFs and updates the active canonical record.
     """
     cert = await _get_owned_certificate(certificate_id, user, db)
 
-    # Fetch all module data
+    # Fetch stored results across all pipeline stages
     doc_type_row = await _fetch_one(db, DocumentType, DocumentType.certificate_id == cert.id)
     ocr_row = await _fetch_one(db, OCRData, OCRData.certificate_id == cert.id)
     verification_row = await _fetch_one(db, VerificationResult, VerificationResult.certificate_id == cert.id)
@@ -107,67 +115,149 @@ async def generate_report(
     if cert.group_id:
         comparison_row = await _fetch_one(db, DocumentComparison, DocumentComparison.group_id == cert.group_id)
 
-    # Require completed processing before generating report
-    if not verification_row or not prediction_row:
+    # Require minimum verification completion before generating official report
+    missing = []
+    if not verification_row:
+        missing.append("Verification stages (QR/Tampering/Duplicate)")
+    if not prediction_row:
+        missing.append("Final Prediction & Trust Score")
+    if not ocr_row:
+        missing.append("OCR extraction")
+    if missing:
         raise HTTPException(
             status_code=400,
-            detail="Cannot generate report while required processing is pending. Please execute the verification pipeline first."
+            detail=f"Cannot generate report while required processing is pending. Missing: {', '.join(missing)}. Please execute the verification pipeline first."
         )
 
-    # Determine verification ID (reuse if report exists)
-    existing_report = await _fetch_one(db, VerificationReport, VerificationReport.certificate_id == cert.id)
-    verification_id = existing_report.verification_id if existing_report else _make_verification_id()
-    generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    # Fetch auditing organization branding
+    org_name = getattr(settings, "REPORT_ORG_NAME", "CertiVerify Enterprise")
+    if cert.organization_id:
+        org_res = await db.execute(select(Organization).where(Organization.id == cert.organization_id))
+        org_obj = org_res.scalar_one_or_none()
+        if org_obj and org_obj.name:
+            org_name = org_obj.name
 
-    # Build dicts for the PDF service
+    # Check for existing report (Idempotent re-generation)
+    existing_report = await _fetch_one(db, VerificationReport, VerificationReport.certificate_id == cert.id)
+    verification_id = make_verification_id()
+    generated_at_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    # If an existing PDF exists, archive it in the filesystem archive directory
+    out_dir = get_report_output_dir()
+    existing_resolved = resolve_report_path(existing_report.pdf_path if existing_report else None)
+    if existing_report and existing_resolved and existing_resolved.is_file():
+        archive_dir = out_dir / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        old_ts = int(existing_report.generated_at.timestamp()) if existing_report.generated_at else int(datetime.utcnow().timestamp())
+        archive_filename = f"{existing_report.verification_id}_archived_{old_ts}.pdf"
+        archive_path = archive_dir / archive_filename
+        try:
+            os.replace(str(existing_resolved), str(archive_path))
+            logger.info("Archived previous report PDF to %s", archive_path)
+        except Exception as exc:
+            logger.warning("Could not archive previous report PDF: %s", exc)
+
+    # Build dictionaries for PDF generation
     cert_dict = _row_to_dict(cert)
-    cert_dict["uploaded_at"] = cert.uploaded_at.strftime("%Y-%m-%d %H:%M UTC")
+    cert_dict["uploaded_at"] = cert.uploaded_at.strftime("%Y-%m-%d %H:%M UTC") if cert.uploaded_at else "—"
 
     report_meta = {
         "verification_id": verification_id,
-        "generated_at": generated_at,
-        "digital_signature": None,  # computed below
+        "generated_at": generated_at_str,
+        "verifier_name": user.full_name or "Authorized Verifier",
+        "verifier_email": user.email or "verifier@certiverify.ai",
+        "organization_name": org_name,
+        "digital_signature": None,
     }
 
-    # Compute digital signature before PDF (it's embedded in the PDF)
-    sig = compute_digital_signature(cert_dict, report_meta)
-    report_meta["digital_signature"] = sig
+    # Generate PDF bytes strictly from stored results (offloaded to thread to keep event loop responsive)
+    try:
+        pdf_bytes = await asyncio.to_thread(
+            generate_report_pdf,
+            cert=cert_dict,
+            doc_type_row=_row_to_dict(doc_type_row),
+            ocr_row=_row_to_dict(ocr_row),
+            comparison_row=_row_to_dict(comparison_row),
+            verification_row=_row_to_dict(verification_row),
+            fraud_row=_row_to_dict(fraud_row),
+            trust_row=_row_to_dict(trust_row),
+            prediction_row=_row_to_dict(prediction_row),
+            report_row=report_meta,
+        )
+    except Exception as exc:
+        logger.exception("Failed to build PDF report for certificate %s: %s", cert.id, exc)
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(exc)}")
 
-    # Generate PDF bytes
-    pdf_bytes = generate_report_pdf(
-        cert=cert_dict,
-        doc_type_row=_row_to_dict(doc_type_row),
-        ocr_row=_row_to_dict(ocr_row),
-        comparison_row=_row_to_dict(comparison_row),
-        verification_row=_row_to_dict(verification_row),
-        fraud_row=_row_to_dict(fraud_row),
-        trust_row=_row_to_dict(trust_row),
-        prediction_row=_row_to_dict(prediction_row),
-        report_row=report_meta,
-    )
+    # Compute detached digital signature over the generated PDF bytes
+    try:
+        sig = compute_report_signature(pdf_bytes)
+        report_meta["digital_signature"] = sig
+    except RuntimeError as re_err:
+        raise HTTPException(status_code=500, detail=str(re_err))
 
-    # Persist PDF to disk (using the configured upload dir)
-    reports_dir = os.path.join(settings.UPLOAD_DIR, "reports")
-    os.makedirs(reports_dir, exist_ok=True)
+    # Persist PDF to canonical reports storage directory atomically
     pdf_filename = f"{verification_id}.pdf"
-    pdf_path = os.path.join(reports_dir, pdf_filename)
-    with open(pdf_path, "wb") as f:
+    pdf_file_path = out_dir / pdf_filename
+    tmp_file_path = out_dir / f"{verification_id}.tmp"
+    with open(tmp_file_path, "wb") as f:
         f.write(pdf_bytes)
+    os.replace(str(tmp_file_path), str(pdf_file_path))
+    pdf_path = str(pdf_file_path)
 
-    # Upsert VerificationReport
-    if existing_report is None:
+    # Upsert VerificationReport row
+    is_new = existing_report is None
+    if is_new:
         report_row = VerificationReport(
             certificate_id=cert.id,
             verification_id=verification_id,
             pdf_path=pdf_path,
             digital_signature=sig,
+            generated_at=datetime.utcnow(),
         )
         db.add(report_row)
     else:
+        existing_report.verification_id = verification_id
         existing_report.pdf_path = pdf_path
         existing_report.digital_signature = sig
         existing_report.generated_at = datetime.utcnow()
         report_row = existing_report
+
+    # Update VerificationJob stage_states if one exists
+    try:
+        job_res = await db.execute(
+            select(VerificationJob)
+            .where(VerificationJob.certificate_id == cert.id)
+            .order_by(VerificationJob.id.desc())
+        )
+        job = job_res.scalars().first()
+        if job:
+            s_states = dict(job.stage_states or {})
+            s_states["report"] = {
+                "status": "COMPLETED",
+                "verification_id": verification_id,
+                "pdf_path": pdf_path,
+                "digital_signature": sig,
+                "completed_at": datetime.utcnow().isoformat(),
+            }
+            job.stage_states = s_states
+    except Exception as job_err:
+        logger.warning("Could not update VerificationJob stage_states for report: %s", job_err)
+
+    # Audit logging
+    await log_audit_event(
+        db,
+        action="verification:report_generated" if is_new else "verification:report_regenerated",
+        entity_type="verification_report",
+        actor_user_id=user.id,
+        organization_id=cert.organization_id or user.organization_id,
+        entity_id=cert.id,
+        metadata_json={
+            "certificate_id": cert.id,
+            "verification_id": verification_id,
+            "digital_signature": sig,
+            "pdf_path": pdf_path,
+        },
+    )
 
     await db.commit()
     await db.refresh(report_row)
@@ -204,33 +294,243 @@ async def get_report(
 @router.get("/api/v1/certificates/{certificate_id}/download-report")
 async def download_report(
     certificate_id: str,
+    inline: bool = Query(False, description="Open PDF inline instead of attachment"),
+    user: User = Depends(get_current_verified_user_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Streams the saved PDF report using FileResponse with RFC 5987 headers.
+    Scoped by organization_id and owner.
+    Supports Bearer token headers and ?token= query parameter for direct browser downloads/views.
+    If the report row exists in the database but the file on disk is missing,
+    automatically re-generates the report PDF from stored pipeline stage results.
+    """
+    try:
+        cert = await _get_owned_certificate(certificate_id, user, db)
+    except HTTPException:
+        raise
+    except Exception as auth_err:
+        logger.exception("Authorization error accessing certificate %s: %s", certificate_id, auth_err)
+        raise HTTPException(status_code=403, detail="Not authorized to access this certificate's report.")
+
+    report_row = await _fetch_one(db, VerificationReport, VerificationReport.certificate_id == cert.id)
+    if not report_row:
+        raise HTTPException(
+            status_code=404,
+            detail="Verification report not found for this certificate. Please generate the report first via POST /generate-report.",
+        )
+
+    resolved_path = resolve_report_path(report_row.pdf_path, report_row.verification_id)
+
+    # Self-healing: If report row exists in DB but PDF file is missing on disk, regenerate on the fly
+    if not resolved_path or not resolved_path.is_file():
+        logger.warning(
+            "Report PDF file missing from disk for cert %s (stored: %s). Auto-regenerating...",
+            cert.id, report_row.pdf_path
+        )
+        try:
+            doc_type_row = await _fetch_one(db, DocumentType, DocumentType.certificate_id == cert.id)
+            ocr_row = await _fetch_one(db, OCRData, OCRData.certificate_id == cert.id)
+            verification_row = await _fetch_one(db, VerificationResult, VerificationResult.certificate_id == cert.id)
+            fraud_row = await _fetch_one(db, FraudAnalysis, FraudAnalysis.certificate_id == cert.id)
+            trust_row = await _fetch_one(db, TrustScore, TrustScore.certificate_id == cert.id)
+            prediction_row = await _fetch_one(db, FinalPrediction, FinalPrediction.certificate_id == cert.id)
+            comparison_row = None
+            if cert.group_id:
+                comparison_row = await _fetch_one(db, DocumentComparison, DocumentComparison.group_id == cert.group_id)
+
+            org_name = getattr(settings, "REPORT_ORG_NAME", "CertiVerify Enterprise")
+            if cert.organization_id:
+                org_res = await db.execute(select(Organization).where(Organization.id == cert.organization_id))
+                org_obj = org_res.scalar_one_or_none()
+                if org_obj and org_obj.name:
+                    org_name = org_obj.name
+
+            cert_dict = _row_to_dict(cert)
+            cert_dict["uploaded_at"] = cert.uploaded_at.strftime("%Y-%m-%d %H:%M UTC") if cert.uploaded_at else "—"
+
+            report_meta = {
+                "verification_id": report_row.verification_id,
+                "generated_at": report_row.generated_at.strftime("%Y-%m-%d %H:%M UTC") if report_row.generated_at else datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+                "verifier_name": user.full_name or "Authorized Verifier",
+                "verifier_email": user.email or "verifier@certiverify.ai",
+                "organization_name": org_name,
+                "digital_signature": report_row.digital_signature,
+            }
+
+            pdf_bytes = await asyncio.to_thread(
+                generate_report_pdf,
+                cert=cert_dict,
+                doc_type_row=_row_to_dict(doc_type_row),
+                ocr_row=_row_to_dict(ocr_row),
+                comparison_row=_row_to_dict(comparison_row),
+                verification_row=_row_to_dict(verification_row),
+                fraud_row=_row_to_dict(fraud_row),
+                trust_row=_row_to_dict(trust_row),
+                prediction_row=_row_to_dict(prediction_row),
+                report_row=report_meta,
+            )
+
+            sig = compute_report_signature(pdf_bytes)
+            out_dir = get_report_output_dir()
+            pdf_filename = f"{report_row.verification_id}.pdf"
+            new_file_path = out_dir / pdf_filename
+            with open(new_file_path, "wb") as f:
+                f.write(pdf_bytes)
+
+            report_row.pdf_path = str(new_file_path)
+            report_row.digital_signature = sig
+            await db.commit()
+            await db.refresh(report_row)
+            resolved_path = new_file_path
+            logger.info("Successfully regenerated report PDF for cert %s at %s", cert.id, resolved_path)
+        except Exception as regen_err:
+            logger.exception("Failed to regenerate missing report PDF for cert %s: %s", cert.id, regen_err)
+            raise HTTPException(
+                status_code=404,
+                detail=f"Report PDF file is missing and could not be regenerated: {str(regen_err)}",
+            )
+
+    try:
+        # Determine disposition
+        disposition_type = "inline" if inline else "attachment"
+
+        # Format RFC 5987 Content-Disposition header with clean ASCII fallback
+        base_name = f"CertiVerify_{report_row.verification_id}"
+        if cert.original_filename:
+            raw_stem = os.path.splitext(cert.original_filename)[0]
+            raw_filename = f"CertiVerify_{raw_stem}_{report_row.verification_id}.pdf"
+        else:
+            raw_filename = f"{base_name}.pdf"
+
+        # ASCII-only fallback (only alphanumeric, dash, underscore, dot)
+        ascii_clean = re.sub(r'[^a-zA-Z0-9_\-.]', '_', raw_filename)
+        if not ascii_clean.endswith(".pdf"):
+            ascii_clean += ".pdf"
+
+        # RFC 5987 percent-encoded UTF-8 filename
+        utf8_encoded = urllib.parse.quote(raw_filename, encoding="utf-8")
+        content_disposition = f'{disposition_type}; filename="{ascii_clean}"; filename*=UTF-8\'\'{utf8_encoded}'
+
+        return FileResponse(
+            path=str(resolved_path),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": content_disposition,
+                "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
+            },
+        )
+    except Exception as exc:
+        logger.exception("Failed to stream report PDF for cert %s (report %s): %s", cert.id, report_row.id, exc)
+        raise HTTPException(status_code=500, detail=f"Failed to stream verification report: {str(exc)}")
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/certificates/{certificate_id}/verify-signature
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/api/v1/certificates/{certificate_id}/verify-signature",
+    response_model=SignatureVerificationResponse,
+)
+async def verify_signature(
+    certificate_id: str,
     user: User = Depends(get_current_verified_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Streams the saved PDF file."""
+    """
+    Verifies the cryptographic HMAC-SHA256 digital signature of the PDF report on disk.
+    Detects any tampering or byte alterations to the report document.
+    """
     cert = await _get_owned_certificate(certificate_id, user, db)
     report_row = await _fetch_one(db, VerificationReport, VerificationReport.certificate_id == cert.id)
     if not report_row or not report_row.pdf_path:
         raise HTTPException(
             status_code=404,
-            detail="PDF not found. Generate the report first via POST /generate-report.",
+            detail="Verification report not found for this certificate. Generate the report first.",
         )
-    if not os.path.exists(report_row.pdf_path):
+
+    resolved_path = resolve_report_path(report_row.pdf_path, report_row.verification_id)
+    if not resolved_path or not resolved_path.is_file():
         raise HTTPException(
             status_code=404,
-            detail="PDF file is missing from storage. Please regenerate the report.",
+            detail="Report PDF file is missing from storage.",
         )
 
-    def _iter_file(path: str):
-        with open(path, "rb") as f:
-            yield from f
-
-    filename = f"CertiVerify_{report_row.verification_id}.pdf"
-    return StreamingResponse(
-        _iter_file(report_row.pdf_path),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    is_valid = verify_report_signature(
+        str(resolved_path),
+        report_row.digital_signature or "",
     )
+
+    detail_msg = (
+        "Cryptographic digital signature verified: PDF document matches institutional key and has not been altered."
+        if is_valid
+        else "Signature verification failed: document content has been altered, corrupted, or signing key mismatch."
+    )
+
+    return SignatureVerificationResponse(
+        is_valid=is_valid,
+        verification_id=report_row.verification_id,
+        digital_signature=report_row.digital_signature,
+        checked_at=datetime.utcnow(),
+        detail=detail_msg,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/reports
+# ---------------------------------------------------------------------------
+
+@router.get("/api/v1/reports", response_model=list[ReportListItem])
+async def list_reports(
+    user: User = Depends(get_current_verified_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lists all generated verification reports scoped to the current user's organization or ownership.
+    """
+    query = (
+        select(VerificationReport, Certificate, FinalPrediction, TrustScore)
+        .join(Certificate, VerificationReport.certificate_id == Certificate.id)
+        .outerjoin(FinalPrediction, Certificate.id == FinalPrediction.certificate_id)
+        .outerjoin(TrustScore, Certificate.id == TrustScore.certificate_id)
+    )
+
+    if user.role != UserRole.ADMIN:
+        if user.organization_id:
+            query = query.where(
+                (Certificate.organization_id == user.organization_id)
+                | (Certificate.owner_id == user.id)
+            )
+        else:
+            query = query.where(Certificate.owner_id == user.id)
+    elif user.organization_id:
+        query = query.where(
+            (Certificate.organization_id == user.organization_id)
+            | (Certificate.owner_id == user.id)
+        )
+
+    query = query.order_by(VerificationReport.generated_at.desc())
+    results = (await db.execute(query)).all()
+
+    items = []
+    for rep, c, pred, trust in results:
+        items.append(
+            ReportListItem(
+                id=rep.id,
+                certificate_id=c.id,
+                certificate_filename=c.original_filename,
+                file_type=c.file_type,
+                sha256_hash=c.sha256_hash,
+                verification_id=rep.verification_id,
+                generated_at=rep.generated_at,
+                digital_signature=rep.digital_signature,
+                pdf_path=rep.pdf_path,
+                prediction_label=pred.label if pred else None,
+                trust_score=trust.score if trust else None,
+            )
+        )
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +584,6 @@ async def get_dashboard_stats(
     report_rows = _map_by_cert_id(
         (await db.execute(select(VerificationReport).where(VerificationReport.certificate_id.in_(cert_ids)))).scalars().all()
     )
-    # Priority 8 — additional bulk fetches
     vr_rows_list = (await db.execute(
         select(VerificationResult).where(VerificationResult.certificate_id.in_(cert_ids))
     )).scalars().all()
@@ -302,7 +601,6 @@ async def get_dashboard_stats(
     fraud_probs = [f.fraud_probability for f in fraud_rows.values() if f.fraud_probability is not None]
     avg_fraud = round(sum(fraud_probs) / len(fraud_probs), 4) if fraud_probs else None
 
-    # Priority 8 — 5 new aggregate fields
     duplicate_count = sum(1 for vr in vr_rows_list if vr.is_duplicate)
     tampered_count = sum(
         1 for vr in vr_rows_list
@@ -403,7 +701,6 @@ async def get_dashboard_stats(
         total_reports_generated=total_reports,
         avg_ocr_accuracy=avg_ocr,
         avg_fraud_probability=avg_fraud,
-        # Priority 8
         duplicate_count=duplicate_count,
         tampered_count=tampered_count,
         qr_verified_count=qr_verified_count,

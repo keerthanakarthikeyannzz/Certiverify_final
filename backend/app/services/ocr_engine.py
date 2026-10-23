@@ -232,8 +232,8 @@ def _run_fitz_fallback(pdf_path: str | None = None) -> tuple[str, float] | None:
         import fitz
         import os
         if pdf_path and os.path.exists(pdf_path):
-            doc = fitz.open(pdf_path)
-            extracted_text = "\n".join(page.get_text() for page in doc)
+            with fitz.open(pdf_path) as doc:
+                extracted_text = "\n".join(page.get_text() for page in doc)
             if len(extracted_text.strip()) > 10:
                 logger.info("✔ PyMuPDF Fallback text extractor succeeded for %s | len=%d", pdf_path, len(extracted_text))
                 return extracted_text, 0.88

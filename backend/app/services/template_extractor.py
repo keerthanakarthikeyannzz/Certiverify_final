@@ -268,28 +268,58 @@ def _first_name_line(lines: list[str], start: int = 0, window: int = 8) -> Optio
 # BBox spatial extraction helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _bbox_cy(bbox: list) -> float:
-    ys = [pt[1] for pt in bbox]
-    return (min(ys) + max(ys)) / 2.0
+def _normalize_bbox_entry(entry: Any) -> tuple[float, float, float, str] | None:
+    """
+    Normalizes a bbox entry to (cx, cy, right_x, text).
+    Handles:
+      - dict format: {"text": str, "x": float, "y": float, "width": float, "height": float, ...}
+      - 3-tuple / list format: (bbox, text, conf) where bbox is [[x, y], ...] or [x, y, w, h]
+      - 2-tuple format: (bbox, text)
+    """
+    if isinstance(entry, dict):
+        text = str(entry.get("text", "")).strip()
+        if not text:
+            return None
+        x = float(entry.get("x", 0.0))
+        y = float(entry.get("y", 0.0))
+        w = float(entry.get("width", 0.0))
+        h = float(entry.get("height", 0.0))
+        return (x + w / 2.0, y + h / 2.0, x + w, text)
 
-
-def _bbox_cx(bbox: list) -> float:
-    xs = [pt[0] for pt in bbox]
-    return (min(xs) + max(xs)) / 2.0
+    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+        bbox = entry[0]
+        text = str(entry[1]).strip()
+        if not text:
+            return None
+        if isinstance(bbox, (list, tuple)) and bbox:
+            if isinstance(bbox[0], (list, tuple)):
+                xs = [float(pt[0]) for pt in bbox]
+                ys = [float(pt[1]) for pt in bbox]
+                return ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0, max(xs), text)
+            elif len(bbox) == 4:
+                x1, y1, x2, y2 = [float(v) for v in bbox]
+                return ((x1 + x2) / 2.0, (y1 + y2) / 2.0, max(x1, x2), text)
+    return None
 
 
 def _find_below_bbox(
-    ocr_results: _BBoxResult, anchor: str,
+    ocr_results: Any, anchor: str,
     y_gap_min: float = 4, y_gap_max: float = 80, x_tol: float = 350,
 ) -> Optional[str]:
+    if not ocr_results:
+        return None
+    normalized: list[tuple[float, float, float, str]] = []
+    for item in ocr_results:
+        parsed = _normalize_bbox_entry(item)
+        if parsed is not None:
+            normalized.append(parsed)
+
     anchor_l = anchor.lower()
-    for bbox, text, _ in ocr_results:
+    for ax, ay, _, text in normalized:
         if anchor_l not in text.lower():
             continue
-        ay, ax = _bbox_cy(bbox), _bbox_cx(bbox)
         candidates: list[tuple[float, str]] = []
-        for bbox2, text2, _ in ocr_results:
-            by, bx = _bbox_cy(bbox2), _bbox_cx(bbox2)
+        for bx, by, _, text2 in normalized:
             dy = by - ay
             if y_gap_min < dy < y_gap_max and abs(bx - ax) < x_tol:
                 candidates.append((dy, text2.strip()))
@@ -300,18 +330,23 @@ def _find_below_bbox(
 
 
 def _find_right_bbox(
-    ocr_results: _BBoxResult, anchor: str,
+    ocr_results: Any, anchor: str,
     x_gap_max: float = 500, y_tol: float = 20,
 ) -> Optional[str]:
+    if not ocr_results:
+        return None
+    normalized: list[tuple[float, float, float, str]] = []
+    for item in ocr_results:
+        parsed = _normalize_bbox_entry(item)
+        if parsed is not None:
+            normalized.append(parsed)
+
     anchor_l = anchor.lower()
-    for bbox, text, _ in ocr_results:
+    for _, ay, ax_right, text in normalized:
         if anchor_l not in text.lower():
             continue
-        ay = _bbox_cy(bbox)
-        ax_right = max(pt[0] for pt in bbox)
         candidates: list[tuple[float, str]] = []
-        for bbox2, text2, _ in ocr_results:
-            by, bx = _bbox_cy(bbox2), _bbox_cx(bbox2)
+        for bx, by, _, text2 in normalized:
             dx = bx - ax_right
             if 0 < dx < x_gap_max and abs(by - ay) < y_tol:
                 candidates.append((dx, text2.strip()))
